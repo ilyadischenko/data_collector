@@ -3,14 +3,15 @@ import os
 import gzip
 import time
 import logging
-from datetime import datetime
-from typing import Set, Dict, List
+from datetime import datetime, timedelta
+from typing import Set, Dict, List, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor
 from glob import glob
+from collections import deque
 
 import aiohttp
 import orjson
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from aiogram import Bot, Dispatcher, types, Router
 from aiogram.filters import Command
@@ -18,101 +19,134 @@ from aiogram.types import FSInputFile
 
 # --- КОНФИГУРАЦИЯ ---
 TELEGRAM_TOKEN = "7706834120:AAFRZ77Oh8mTNgKHXfacwYLr2AOckoNk1Mo" 
-DATA_DIR = "data"
+DATA_DIR = "data_futures"
 BINANCE_WS_URL = "wss://fstream.binance.com/ws"
-FLUSH_INTERVAL = 5   # Сброс на диск каждые 5 сек
-RECONNECT_DELAY = 2
+FLUSH_INTERVAL = 5   
+RECONNECT_DELAY = 2 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+ADMIN_CHAT_ID: Optional[int] = None
+
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# --- CSV INTEGRITY CHECKER ---
-def analyze_file_integrity(filepath: str):
-    """
-    Читает CSV.GZ файл и проверяет последовательность ID.
-    Форматы:
-    Trade: T, EventTime, TradeID, ... (TradeID index = 2)
-    Book:  B, UpdateID, ... (UpdateID index = 1)
-    """
-    trade_gaps = 0
-    trade_duplicates = 0
-    book_jumps = 0
-    
-    last_trade_id = None
-    last_book_u = None
-    
-    total_lines = 0
-    trades_count = 0
-    books_count = 0
-    
-    try:
-        # mode="rt" - читаем как текст
-        with gzip.open(filepath, "rt", encoding="utf-8") as f:
-            for line in f:
-                total_lines += 1
-                # Быстро разбиваем строку
-                parts = line.strip().split(',')
-                if not parts: continue
+# --- УТИЛИТЫ ПАРСИНГА ---
 
-                row_type = parts[0]
-                
-                # --- ПРОВЕРКА ТРЕЙДОВ ---
-                if row_type == 'T':
-                    try:
-                        # T, E, t, p, q, b, a, T, m
-                        # ID находится под индексом 2
-                        tid = int(parts[2])
-                        trades_count += 1
-                        
-                        if last_trade_id is not None:
-                            diff = tid - last_trade_id
-                            if diff > 1:
-                                trade_gaps += (diff - 1)
-                            elif diff == 0:
-                                trade_duplicates += 1
-                        last_trade_id = tid
-                    except (ValueError, IndexError):
-                        pass # Битая строка
-
-                # --- ПРОВЕРКА СТАКАНА ---
-                elif row_type == 'B':
-                    try:
-                        # B, u, b, B, a, A
-                        # ID находится под индексом 1
-                        uid = int(parts[1])
-                        books_count += 1
-                        
-                        if last_book_u is not None:
-                            diff = uid - last_book_u
-                            if diff > 1:
-                                book_jumps += 1
-                        last_book_u = uid
-                    except (ValueError, IndexError):
-                        pass
-
-        return {
-            "status": "ok",
-            "filename": os.path.basename(filepath),
-            "stats": {
-                "lines": total_lines,
-                "trades": trades_count,
-                "books": books_count,
-            },
-            "integrity": {
-                "trade_loss": trade_gaps,       # Должно быть 0
-                "trade_dupes": trade_duplicates,
-                "book_jumps": book_jumps
+def parse_csv_line(line: str):
+    """Парсит строку CSV в словарь"""
+    parts = line.strip().split(',')
+    if not parts: return None
+    row_type = parts[0]
+    
+    # T, EventTime, TradeID, Price, Qty, TransactTime, IsMaker
+    if row_type == 'T':
+        try:
+            ts = int(parts[1])
+            return {
+                "type": "trade",
+                "event_time": ts,
+                "trade_id": int(parts[2]),
+                "price": float(parts[3]),
+                "qty": float(parts[4]),
+                "transact_time": int(parts[5]),
+                "is_maker": bool(int(parts[6]))
             }
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+        except: return None
 
+    # B, UpdateID, BidPr, BidQty, AskPr, AskQty
+    elif row_type == 'B':
+        try:
+            return {
+                "type": "book",
+                # У bookTicker нет времени в потоке, используем approximate time приема, 
+                # но так как его нет в CSV B-строке, это поле будет отсутствовать или null
+                "update_id": int(parts[1]),
+                "bid_p": float(parts[2]),
+                "bid_q": float(parts[3]),
+                "ask_p": float(parts[4]),
+                "ask_q": float(parts[5])
+            }
+        except: return None
+    return None
+
+def get_files_in_range(symbol: str, start_ts: int, end_ts: int) -> List[str]:
+    """
+    Возвращает список файлов, которые ПЕРЕСЕКАЮТСЯ с заданным диапазоном времени.
+    Фильтрация идет по имени файла (YYYYMMDD_HH).
+    """
+    symbol_path = os.path.join(DATA_DIR, symbol.lower())
+    if not os.path.exists(symbol_path): return []
+    
+    all_files = glob(os.path.join(symbol_path, "*.csv.gz"))
+    relevant_files = []
+    
+    # Конвертируем запрос в datetime (без учета таймзон, так как файлы в UTC)
+    start_dt = datetime.utcfromtimestamp(start_ts / 1000)
+    end_dt = datetime.utcfromtimestamp(end_ts / 1000)
+    
+    for f_path in all_files:
+        try:
+            # Имя файла: btcusdt_20231027_14.csv.gz
+            basename = os.path.basename(f_path)
+            # Вырезаем дату и час: 20231027_14
+            date_part = basename.split('_', 1)[1].split('.')[0] 
+            file_dt = datetime.strptime(date_part, "%Y%m%d_%H")
+            
+            # Файл содержит данные за 1 час. 
+            file_end_dt = file_dt + timedelta(hours=1)
+            
+            # Проверка пересечения интервалов
+            # (StartA <= EndB) and (EndA >= StartB)
+            if start_dt < file_end_dt and end_dt >= file_dt:
+                relevant_files.append(f_path)
+        except Exception:
+            continue # Если файл назван криво, пропускаем
+            
+    # Сортируем файлы по времени
+    return sorted(relevant_files)
+
+def extract_data_from_files(files: List[str], start_ts: int, end_ts: int, limit: int, data_type: str):
+    """Читает файлы и фильтрует строки по timestamp"""
+    results = []
+    count = 0
+    
+    for filepath in files:
+        if count >= limit: break
+        try:
+            with gzip.open(filepath, "rt", encoding="utf-8") as f:
+                for line in f:
+                    if count >= limit: break
+                    
+                    # Предварительная фильтрация по типу строки (быстрее чем парсинг)
+                    if data_type == "trade" and not line.startswith("T"): continue
+                    if data_type == "book" and not line.startswith("B"): continue
+                    
+                    parsed = parse_csv_line(line)
+                    if not parsed: continue
+                    
+                    # Фильтрация по времени
+                    # У трейдов есть event_time. У bookTicker в нашем CSV времени нет,
+                    # поэтому bookTicker фильтруем только по попаданию в файл (грубая фильтрация)
+                    # или пропускаем, если нужна строгая выборка по времени.
+                    
+                    if parsed['type'] == 'trade':
+                        if start_ts <= parsed['event_time'] <= end_ts:
+                            results.append(parsed)
+                            count += 1
+                    elif parsed['type'] == 'book':
+                        # Для стакана берем всё, что попало в выбранные часовые файлы,
+                        # так как точного времени в строке CSV нет
+                        results.append(parsed)
+                        count += 1
+                        
+        except Exception: pass
+        
+    return results
 
 # --- COLLECTOR CLASS ---
-class BinanceCollector:
+class BinanceFuturesCollector:
     def __init__(self):
         self.active_symbols: Set[str] = set()
         self.ws = None
@@ -143,7 +177,7 @@ class BinanceCollector:
                 path = os.path.join(DATA_DIR, symbol)
                 if not os.path.exists(path): os.makedirs(path)
                 await self._subscribe([symbol])
-                logger.info(f"Added: {symbol}")
+                logger.info(f"Added {symbol}")
                 return True
             return False
 
@@ -153,14 +187,14 @@ class BinanceCollector:
             if symbol in self.active_symbols:
                 self.active_symbols.remove(symbol)
                 await self._unsubscribe([symbol])
-                logger.info(f"Removed: {symbol}")
+                logger.info(f"Removed {symbol}")
                 return True
             return False
 
     async def _connect_loop(self):
         while self.running:
             try:
-                logger.info("Connecting WS...")
+                logger.info(f"Connecting to {BINANCE_WS_URL}...")
                 async with self.session.ws_connect(BINANCE_WS_URL) as ws:
                     self.ws = ws
                     logger.info("Connected.")
@@ -169,188 +203,165 @@ class BinanceCollector:
 
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = orjson.loads(msg.data)
-                                if "result" in data or "id" in data: continue
-                                
-                                s = data.get("s")
-                                if not s: continue
-                                symbol = s.lower()
-
-                                if symbol in self.active_symbols:
-                                    if symbol not in self.buffer:
-                                        self.buffer[symbol] = []
-                                    
-                                    csv_str = None
-                                    
-                                    # --- ФОРМИРОВАНИЕ CSV СТРОКИ ---
-                                    
-                                    # 1. TRADE
-                                    if data.get("e") == "trade":
-                                        # Структура: T, E, t, p, q, b, a, T, m
-                                        # m (IsMaker) превращаем в 1 или 0
-                                        m_val = "1" if data.get("m") else "0"
-                                        
-                                        # Используем f-string, это очень быстро в Python
-                                        csv_str = (
-                                            f"T,{data.get('E')},{data.get('t')},"
-                                            f"{data.get('p')},{data.get('q')},"
-                                            f"{data.get('b')},{data.get('a')},"
-                                            f"{data.get('T')},{m_val}"
-                                        )
-
-                                    # 2. BOOKTICKER
-                                    # У bookTicker нет поля "e" в raw stream, но есть "u" (UpdateID)
-                                    elif "u" in data:
-                                        # Структура: B, u, b, B, a, A
-                                        csv_str = (
-                                            f"B,{data.get('u')},"
-                                            f"{data.get('b')},{data.get('B')},"
-                                            f"{data.get('a')},{data.get('A')}"
-                                        )
-
-                                    if csv_str:
-                                        # Кодируем в байты и добавляем в буфер
-                                        self.buffer[symbol].append(csv_str.encode('utf-8'))
-
-                            except Exception:
-                                pass
+                            await self._parse_message(msg.data)
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             break
             except Exception as e:
                 logger.error(f"WS Error: {e}")
             await asyncio.sleep(RECONNECT_DELAY)
 
-    async def _subscribe(self, symbols: List[str]):
-        if not self.ws: return
-        params = [f"{s}@bookTicker" for s in symbols] + [f"{s}@trade" for s in symbols]
-        payload = {"method": "SUBSCRIBE", "params": params, "id": int(time.time())}
-        await self.ws.send_json(payload)
+    async def _parse_message(self, raw):
+        try:
+            data = orjson.loads(raw)
+            if "s" not in data: return
+            
+            sym = data["s"].lower()
+            if sym not in self.active_symbols: return
+            if sym not in self.buffer: self.buffer[sym] = []
 
-    async def _unsubscribe(self, symbols: List[str]):
+            csv = None
+            if data.get("e") == "trade":
+                # FUTURES: T, E, t, p, q, T, m
+                is_m = "1" if data.get("m") else "0"
+                csv = f"T,{data.get('E')},{data.get('t')},{data.get('p')},{data.get('q')},{data.get('T')},{is_m}"
+            elif "u" in data:
+                # BOOK: B, u, b, B, a, A
+                csv = f"B,{data.get('u')},{data.get('b')},{data.get('B')},{data.get('a')},{data.get('A')}"
+            
+            if csv: self.buffer[sym].append(csv.encode('utf-8'))
+        except: pass
+
+    async def _subscribe(self, syms):
         if not self.ws: return
-        params = [f"{s}@bookTicker" for s in symbols] + [f"{s}@trade" for s in symbols]
-        payload = {"method": "UNSUBSCRIBE", "params": params, "id": int(time.time())}
-        await self.ws.send_json(payload)
+        params = [f"{s}@bookTicker" for s in syms] + [f"{s}@trade" for s in syms]
+        await self.ws.send_json({"method": "SUBSCRIBE", "params": params, "id": int(time.time())})
+
+    async def _unsubscribe(self, syms):
+        if not self.ws: return
+        params = [f"{s}@bookTicker" for s in syms] + [f"{s}@trade" for s in syms]
+        await self.ws.send_json({"method": "UNSUBSCRIBE", "params": params, "id": int(time.time())})
 
     async def _flush_loop(self):
         while self.running:
             await asyncio.sleep(FLUSH_INTERVAL)
-            # Ротация по часам
             suffix = datetime.utcnow().strftime("%Y%m%d_%H")
-            
             async with self.lock:
                 tasks = []
-                for symbol, records in self.buffer.items():
-                    if not records: continue
-                    
-                    # Имя файла теперь заканчивается на .csv.gz
-                    filename = os.path.join(DATA_DIR, symbol, f"{symbol}_{suffix}.csv.gz")
-                    
-                    # Копируем и очищаем
-                    data_to_write = records[:]
-                    self.buffer[symbol] = []
-
-                    # В пул потоков
-                    tasks.append(
-                        asyncio.get_event_loop().run_in_executor(
-                            self.thread_pool,
-                            self._write_bytes,
-                            filename,
-                            data_to_write
-                        )
-                    )
+                for s, recs in self.buffer.items():
+                    if not recs: continue
+                    fname = os.path.join(DATA_DIR, s, f"{s}_{suffix}.csv.gz")
+                    data = recs[:]
+                    self.buffer[s] = []
+                    tasks.append(asyncio.get_event_loop().run_in_executor(
+                        self.thread_pool, self._write, fname, data))
                 if tasks: await asyncio.gather(*tasks)
 
-    def _write_bytes(self, filename, records):
-        # ab = append binary
-        with gzip.open(filename, "ab", compresslevel=3) as f:
-            for r in records:
-                f.write(r)
-                f.write(b"\n")
+    def _write(self, name, data):
+        with gzip.open(name, "ab", compresslevel=3) as f:
+            for d in data: f.write(d + b"\n")
 
-# --- APP SETUP ---
-collector = BinanceCollector()
-app = FastAPI()
+# --- APP ---
+collector = BinanceFuturesCollector()
+app = FastAPI(title="Futures Data Service")
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# --- API ---
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_view():
-    html = """<html><head><title>Data Monitor</title><style>
-    body{font-family:sans-serif;padding:20px;} table{width:100%;border-collapse:collapse;}
-    th,td{padding:8px;border-bottom:1px solid #ddd;text-align:left} th{background:#007bff;color:white}
-    .btn{padding:4px 8px;text-decoration:none;color:white;border-radius:4px;margin-right:5px}
-    .dl{background:#28a745} .chk{background:#17a2b8}
-    </style></head><body><h1>Data Files (CSV Compressed)</h1><table>
-    <tr><th>Symbol</th><th>File</th><th>Size</th><th>Actions</th></tr>"""
+# ==============================
+# 🕹️ API: CONTROL (УПРАВЛЕНИЕ)
+# ==============================
+
+@app.post("/api/control/start/{symbol}")
+async def start_recording(symbol: str):
+    """Добавить монету в сбор"""
+    res = await collector.add_symbol(symbol)
+    return {"status": "ok", "symbol": symbol, "started": res}
+
+@app.post("/api/control/stop/{symbol}")
+async def stop_recording(symbol: str):
+    """Остановить запись монеты"""
+    res = await collector.remove_symbol(symbol)
+    return {"status": "ok", "symbol": symbol, "stopped": res}
+
+@app.get("/api/control/list")
+async def list_active():
+    """Список активных монет"""
+    return {"active_count": len(collector.active_symbols), "symbols": list(collector.active_symbols)}
+
+# ==============================
+# 💾 API: DATA ACCESS (ВЫГРУЗКА)
+# ==============================
+
+@app.get("/api/history/{symbol}")
+async def get_history(
+    symbol: str, 
+    from_ts: int = Query(..., description="Start Timestamp (ms)"),
+    to_ts: int = Query(..., description="End Timestamp (ms)"),
+    limit: int = Query(1000, le=10000, description="Max records to return"),
+    type: Literal["all", "trade", "book"] = "all"
+):
+    """
+    Получить исторические данные за период.
+    Умный фильтр выбирает нужные архивные файлы по дате.
+    """
+    symbol = symbol.lower()
     
-    rows = ""
-    if os.path.exists(DATA_DIR):
-        for s in sorted(os.listdir(DATA_DIR)):
-            spath = os.path.join(DATA_DIR, s)
-            if not os.path.isdir(spath): continue
-            # Ищем .csv.gz
-            files = sorted(glob(os.path.join(spath, "*.csv.gz")), reverse=True)[:5]
-            for f in files:
-                fn = os.path.basename(f)
-                sz = os.path.getsize(f) / 1024 / 1024
-                rows += f"<tr><td>{s.upper()}</td><td>{fn}</td><td>{sz:.2f} MB</td>"
-                rows += f"<td><a href='/dl/{s}/{fn}' class='btn dl'>DL</a><a href='/chk/{s}/{fn}' class='btn chk'>Check</a></td></tr>"
+    # 1. Находим файлы, которые затрагивают этот период
+    files = get_files_in_range(symbol, from_ts, to_ts)
     
-    return html + rows + "</table></body></html>"
+    if not files:
+        return {"status": "ok", "count": 0, "data": [], "msg": "No files found for this time range"}
 
-@app.get("/dl/{symbol}/{filename}")
-async def download(symbol: str, filename: str):
-    path = os.path.join(DATA_DIR, symbol.lower(), filename)
-    if not os.path.exists(path) or ".." in filename: raise HTTPException(404)
-    return FileResponse(path, media_type='application/gzip', filename=filename)
-
-@app.get("/chk/{symbol}/{filename}")
-async def check(symbol: str, filename: str):
-    path = os.path.join(DATA_DIR, symbol.lower(), filename)
-    if not os.path.exists(path) or ".." in filename: raise HTTPException(404)
-    return await asyncio.get_event_loop().run_in_executor(None, analyze_file_integrity, path)
-
-@app.post("/add/{symbol}")
-async def api_add(symbol: str): return {"res": await collector.add_symbol(symbol)}
-
-@app.post("/stop/{symbol}")
-async def api_stop(symbol: str): return {"res": await collector.remove_symbol(symbol)}
+    # 2. Выполняем чтение и фильтрацию в пуле потоков (CPU intensive)
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, 
+        extract_data_from_files, 
+        files, from_ts, to_ts, limit, type
+    )
+    
+    return {
+        "symbol": symbol,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "files_scanned": len(files),
+        "count": len(data),
+        "data": data
+    }
 
 # --- TELEGRAM ---
 @router.message(Command("start"))
-async def start_cmd(m: types.Message): await m.answer("/add <sym>, /stop <sym>, /get <sym>")
+async def cmd_start(m: types.Message):
+    global ADMIN_CHAT_ID
+    ADMIN_CHAT_ID = m.chat.id
+    await m.answer("Bot active. Admin ID saved.")
 
 @router.message(Command("add"))
-async def add_cmd(m: types.Message):
+async def cmd_add(m: types.Message):
     args = m.text.split()
-    if len(args)>1 and await collector.add_symbol(args[1]): await m.answer("Started")
+    if len(args) > 1:
+        if await collector.add_symbol(args[1]): await m.answer(f"✅ {args[1]}")
 
 @router.message(Command("stop"))
-async def stop_cmd(m: types.Message):
+async def cmd_stop(m: types.Message):
     args = m.text.split()
-    if len(args)>1 and await collector.remove_symbol(args[1]): await m.answer("Stopped")
+    if len(args) > 1:
+        if await collector.remove_symbol(args[1]): await m.answer(f"🛑 {args[1]}")
 
-@router.message(Command("get"))
-async def get_cmd(m: types.Message):
-    args = m.text.split()
-    if len(args) < 2: return
-    files = glob(os.path.join(DATA_DIR, args[1].lower(), "*.csv.gz"))
-    if files:
-        latest = max(files, key=os.path.getctime)
-        await m.answer_document(FSInputFile(latest))
-    else: await m.answer("No files")
+@router.message(Command("list"))
+async def cmd_list(m: types.Message):
+    await m.answer(f"Active: {list(collector.active_symbols)}")
 
 dp.include_router(router)
 
-# --- STARTUP ---
 @app.on_event("startup")
-async def on_startup():
+async def start():
     await collector.start()
     asyncio.create_task(dp.start_polling(bot))
+
+@app.on_event("shutdown")
+async def stop():
+    await collector.stop()
 
 if __name__ == "__main__":
     import uvicorn

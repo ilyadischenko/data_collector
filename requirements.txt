@@ -2,7 +2,4 @@ fastapi
 uvicorn
 aiogram
 aiohttp
-python-dotenv
 orjson
-jinja2
-multipart
