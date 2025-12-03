@@ -3,3 +3,5 @@ uvicorn
 aiogram
 aiohttp
 orjson
+boto3
+websockets
