@@ -8,29 +8,26 @@ import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Set, Deque, Dict, Optional
+from typing import Set, Deque, Dict
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-class BinanceCollector:
+class BybitCollector:
     def __init__(self):
-        self.ws_url = "wss://fstream.binance.com/ws"
-        self.exchange = "binance"
+        # Bybit V5 Public Linear Stream
+        self.ws_url = "wss://stream.bybit.com/v5/public/linear"
+        self.exchange = "bybit"
         self.active_symbols: Set[str] = set()
         self.symbol_buffers: Dict[str, Deque[str]] = {}
         self.thread_pool = ThreadPoolExecutor(max_workers=2)
         self.is_running = False
-        self.logger = logging.getLogger("Binance")
+        self.logger = logging.getLogger("Bybit")
         self.subscription_lock = asyncio.Lock()
         self.ws = None
         self.loop = None
 
-
-
     async def run(self):
         self.loop = asyncio.get_running_loop()
         self.is_running = True
-        self.logger.info("🚀 Started Binance Collector")
+        self.logger.info("🚀 Started Bybit Collector")
         await asyncio.gather(self._ws_listener(), self._periodic_disk_flush())
 
     async def stop(self):
@@ -53,7 +50,7 @@ class BinanceCollector:
                 return self.ws.open
             except AttributeError:
                 return False
-    
+
     async def _periodic_disk_flush(self):
         while self.is_running:
             await asyncio.sleep(5)
@@ -85,35 +82,81 @@ class BinanceCollector:
                 async with websockets.connect(self.ws_url) as ws:
                     self.ws = ws
                     await self._subscribe()
+                    
+                    # Пинг каждые 20 сек (Bybit требует)
+                    async def pinger():
+                        while self.is_running and self.ws:
+                            await asyncio.sleep(20)
+                            try: await self.ws.send(json.dumps({"op": "ping"}))
+                            except: break
+                    asyncio.create_task(pinger())
+
                     async for msg in ws:
                         if not self.is_running: break
                         self._parse(msg)
-            except Exception:
+            except Exception as e:
+                self.logger.error(f"WS Error: {e}")
                 await asyncio.sleep(5)
 
     async def _subscribe(self):
         if not self.active_symbols: return
-        streams = []
-        for s in self.active_symbols: streams.extend([f"{s}@bookTicker", f"{s}@aggTrade"])
-        if streams:
-            await self.ws.send(json.dumps({'method': 'SUBSCRIBE', 'params': streams, 'id': 1}))
+        args = []
+        for s in self.active_symbols:
+            args.append(f"publicTrade.{s.upper()}")
+            args.append(f"orderbook.1.{s.upper()}") # Level 1 Orderbook = BookTicker
+        
+        # Bybit позволяет подписываться батчами (max 10 args)
+        # Тут упрощенно шлем все сразу, но для продакшена надо делить на чанки по 10
+        if args:
+            req = {"op": "subscribe", "args": args}
+            await self.ws.send(json.dumps(req))
 
     def _parse(self, raw):
         try:
             data = json.loads(raw)
-            sym = data.get("s", "").lower()
-            if not sym or sym not in self.symbol_buffers: return
+            if "topic" not in data: return
             
+            topic = data["topic"] # e.g. "publicTrade.BTCUSDT"
+            
+            # Извлекаем символ из топика
+            parts = topic.split('.')
+            sym = parts[-1].lower()
+            
+            if sym not in self.symbol_buffers: return
+            
+            payload = data["data"]
             line = None
-            if data.get("e") == "aggTrade":
-                # T, EventTime, TradeId, Price, Qty, TradeTime, IsMaker
-                mk = "1" if data.get("m") else "0"
-                line = f'T,{data["E"]},{data["a"]},{data["p"]},{data["q"]},{data["T"]},{mk}'
-            elif "u" in data: # BookTicker
+
+            # 1. Trades
+            if topic.startswith("publicTrade"):
+                # Payload is a LIST of trades
+                for t in payload:
+                    # T, Time, TradeId, Price, Qty, TradeTime(ts), Side(Buy/Sell -> Maker?)
+                    # Bybit: S="Buy" means Taker bought (Maker sold). S="Sell" means Taker sold.
+                    # is_maker logic: If side is Buy, Maker is Sell side.
+                    # Simple CSV: T, ts, trade_id, price, size, side
+                    
+                    # Приведем к формату бинанса насколько возможно
+                    # T, EventTime, TradeId, Price, Qty, TradeTime, IsMaker
+                    # is_maker сложно определить точно без контекста, запишем Side
+                    is_buyer_maker = "0" if t["S"] == "Buy" else "1" 
+                    
+                    line = f'T,{t["T"]},{t["i"]},{t["p"]},{t["v"]},{t["T"]},{is_buyer_maker}'
+                    self.symbol_buffers[sym].append(line)
+
+            # 2. BookTicker (Orderbook Level 1)
+            elif topic.startswith("orderbook.1"):
+                # Payload: { "b": [["20000", "0.1"]], "a": [["20001", "0.2"]], "u": 123, "ts": ... }
+                ts = data.get("ts", int(time.time()*1000))
+                u_id = payload.get("u", 0)
+                
+                bid_p, bid_q = payload["b"][0] if payload.get("b") else ("0", "0")
+                ask_p, ask_q = payload["a"][0] if payload.get("a") else ("0", "0")
+                
                 # B, EventTime, UpdateId, BidPr, BidQty, AskPr, AskQty
-                line = f'B,{data.get("E", int(time.time()*1000))},{data["u"]},{data["b"]},{data["B"]},{data["a"]},{data["A"]}'
-            
-            if line: self.symbol_buffers[sym].append(line)
+                line = f'B,{ts},{u_id},{bid_p},{bid_q},{ask_p},{ask_q}'
+                self.symbol_buffers[sym].append(line)
+
         except: pass
 
     async def add_symbol(self, symbol: str):
@@ -125,7 +168,9 @@ class BinanceCollector:
 
             is_connected = self._ws_is_connected()
             if is_connected:
-                await self.ws.send(json.dumps({'method': 'SUBSCRIBE', 'params': [f"{s}@bookTicker", f"{s}@aggTrade"], 'id': 1}))
+                # Bybit требует UPPERCASE в подписке
+                req = {"op": "subscribe", "args": [f"publicTrade.{s.upper()}", f"orderbook.1.{s.upper()}"]}
+                await self.ws.send(json.dumps(req))
 
     async def remove_symbol(self, symbol: str):
         s = symbol.lower()
@@ -135,4 +180,6 @@ class BinanceCollector:
 
             is_connected = self._ws_is_connected()
             if is_connected:
-                await self.ws.send(json.dumps({'method': 'UNSUBSCRIBE', 'params': [f"{s}@bookTicker", f"{s}@aggTrade"], 'id': 1}))
+                req = {"op": "unsubscribe", "args": [f"publicTrade.{s.upper()}", f"orderbook.1.{s.upper()}"]}
+                await self.ws.send(json.dumps(req))
+

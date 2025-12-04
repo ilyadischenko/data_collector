@@ -1,3 +1,4 @@
+from typing import Optional
 import boto3
 from boto3.session import Session
 from botocore.exceptions import ClientError
@@ -89,3 +90,15 @@ class CloudStorage:
             date,
             hour
         )
+    
+    def download_bytes(self, key: str) -> Optional[bytes]:
+        """Синхронное скачивание файла в память."""
+        try:
+            response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
+            return response['Body'].read()
+        except ClientError:
+            # Файла нет - это нормально, просто возвращаем None
+            return None
+        except Exception as e:
+            self.log.error(f"Download failed {key}: {e}")
+            return None
