@@ -40,7 +40,7 @@ class CloudStorage:
         symbol: str,
         date: str,
         hour: str,
-        data_type: Literal["trades", "orderbook"]
+        data_type: Literal["trades", "orderbook", "depth"]  # Добавлен "depth"
     ) -> str:
         """
         Формирует путь файла в бакете.
@@ -50,7 +50,7 @@ class CloudStorage:
             symbol: символ (btcusdt)
             date: дата в формате YYYYMMDD
             hour: час (0-23)
-            data_type: тип данных (trades или orderbook)
+            data_type: тип данных (trades, orderbook или depth)
         
         Returns:
             Путь в S3, например: futures/binance/btcusdt/20250115/14_trades.gz
@@ -64,7 +64,7 @@ class CloudStorage:
         symbol: str,
         date: str,
         hour: str,
-        data_type: Literal["trades", "orderbook"]
+        data_type: Literal["trades", "orderbook", "depth"]  # Добавлен "depth"
     ) -> bool:
         """
         Синхронная загрузка файла.
@@ -77,7 +77,7 @@ class CloudStorage:
             symbol: символ
             date: дата (YYYYMMDD)
             hour: час (0-23)
-            data_type: trades или orderbook
+            data_type: trades, orderbook или depth
         """
         key = self.get_cloud_key(exchange, symbol, date, hour, data_type)
         local_path = Path(local_path)
@@ -110,7 +110,7 @@ class CloudStorage:
         symbol: str,
         date: str,
         hour: str,
-        data_type: Literal["trades", "orderbook"]
+        data_type: Literal["trades", "orderbook", "depth"]  # Добавлен "depth"
     ) -> bool:
         """
         Асинхронная обертка для загрузки файла.
@@ -137,19 +137,25 @@ class CloudStorage:
         data_dir: Path | str = Path("collected_data")
     ) -> dict[str, bool]:
         """
-        Загружает оба файла (trades и orderbook) за определенный час.
+        Загружает все файлы (trades, orderbook, depth) за определенный час.
         
         Returns:
-            {"trades": True/False, "orderbook": True/False}
+            {"trades": True/False, "orderbook": True/False, "depth": True/False}
         """
         data_dir = Path(data_dir)
         results = {}
         
-        for data_type in ["trades", "orderbook"]:
+        # Добавлен "depth" в список типов данных
+        for data_type in ["trades", "orderbook", "depth"]:
             # Формат локального файла: binance_btcusdt_20251204_13_trades.csv.gz
             filename = f"{exchange}_{symbol}_{date}_{hour}_{data_type}.csv.gz"
             local_path = data_dir / filename
             
+            # Если файл не существует, просто пометим как False
+            if not local_path.exists():
+                results[data_type] = False
+                continue
+                
             results[data_type] = self.upload_file(
                 local_path, exchange, symbol, date, hour, data_type
             )
@@ -165,29 +171,35 @@ class CloudStorage:
         data_dir: Path | str = Path("collected_data")
     ) -> dict[str, bool]:
         """
-        Асинхронная загрузка обоих файлов за час.
-        Загружает trades и orderbook параллельно.
+        Асинхронная загрузка всех файлов за час.
+        Загружает trades, orderbook и depth параллельно.
         """
         data_dir = Path(data_dir)
         
         # Запускаем загрузку параллельно
         tasks = []
-        for data_type in ["trades", "orderbook"]:
+        data_types = []
+        
+        # Добавлен "depth" в список типов данных
+        for data_type in ["trades", "orderbook", "depth"]:
             filename = f"{exchange}_{symbol}_{date}_{hour}_{data_type}.csv.gz"
             local_path = data_dir / filename
             
-            tasks.append(
-                self.async_upload_file(
-                    local_path, exchange, symbol, date, hour, data_type
+            # Проверяем существование файла
+            if local_path.exists():
+                tasks.append(
+                    self.async_upload_file(
+                        local_path, exchange, symbol, date, hour, data_type
+                    )
                 )
-            )
+                data_types.append(data_type)
         
-        results = await asyncio.gather(*tasks)
-        
-        return {
-            "trades": results[0],
-            "orderbook": results[1]
-        }
+        # Если есть файлы для загрузки
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            return {data_type: result for data_type, result in zip(data_types, results)}
+        else:
+            return {"trades": False, "orderbook": False, "depth": False}
 
     def force_upload_current_hour(
         self,
@@ -201,7 +213,7 @@ class CloudStorage:
         
         Example:
             >>> cloud.force_upload_current_hour("binance", "btcusdt")
-            {'trades': True, 'orderbook': True}
+            {'trades': True, 'orderbook': True, 'depth': True}
         """
         from datetime import datetime, timezone
         
@@ -262,7 +274,13 @@ class CloudStorage:
                 symbol = parts[1]
                 date = parts[2]
                 hour = parts[3]
-                data_type = parts[4]  # trades или orderbook
+                data_type = parts[4]  # trades, orderbook или depth
+                
+                # Проверка на допустимый тип данных
+                if data_type not in ["trades", "orderbook", "depth"]:
+                    self.log.warning(f"⚠️  Неизвестный тип данных: {data_type}")
+                    stats["skipped"] += 1
+                    continue
                 
                 success = self.upload_file(
                     file_path, exchange, symbol, date, hour, data_type
@@ -314,6 +332,10 @@ class CloudStorage:
                     date = parts[2]
                     hour = parts[3]
                     data_type = parts[4]
+                    
+                    # Проверка на допустимый тип данных
+                    if data_type not in ["trades", "orderbook", "depth"]:
+                        return "skipped"
                     
                     success = await self.async_upload_file(
                         file_path, exchange, symbol, date, hour, data_type

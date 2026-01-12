@@ -194,7 +194,7 @@ class CloudManager:
             data_type = parts[4]     # trades или orderbook
 
             # Проверяем корректность data_type
-            if data_type not in ["trades", "orderbook"]:
+            if data_type not in ["trades", "orderbook", "depth"]:
                 self.logger.warning(
                     f"⚠️ Unknown data type '{data_type}' in {filepath.name}"
                 )
@@ -280,8 +280,8 @@ class CloudManager:
                 'total_files': 10,
                 'total_size_mb': 125.5,
                 'by_symbol': {
-                    'binance_btcusdt': {'trades': 5, 'orderbook': 5},
-                    'bybit_ethusdt': {'trades': 3, 'orderbook': 2}
+                    'binance_btcusdt': {'trades': 5, 'orderbook': 5, 'depth': 5},
+                    'bybit_ethusdt': {'trades': 3, 'orderbook': 2, 'depth': 0}
                 },
                 'current_hour_files': 4,
                 'past_hour_files': 6
@@ -322,9 +322,9 @@ class CloudManager:
                     
                     key = f"{exchange}_{symbol}"
                     if key not in stats['by_symbol']:
-                        stats['by_symbol'][key] = {'trades': 0, 'orderbook': 0}
+                        stats['by_symbol'][key] = {'trades': 0, 'orderbook': 0, 'depth': 0}
                     
-                    if data_type in ['trades', 'orderbook']:
+                    if data_type in ['trades', 'orderbook', 'depth']:
                         stats['by_symbol'][key][data_type] += 1
             except:
                 pass

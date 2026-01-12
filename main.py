@@ -6,6 +6,8 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
+from collectors.gate import GateCollector
+
 # Импорты наших модулей
 try:
     from collectors.binance import BinanceCollector
@@ -41,10 +43,15 @@ async def lifespan(app: FastAPI):
     app.state.bybit = bybit
     t2 = asyncio.create_task(bybit.run())
     
+        # 2. Bybit Collector
+    gate = GateCollector()
+    app.state.gate = gate
+    t3 = asyncio.create_task(gate.run())
+
     # 3. Cloud Manager
     manager = CloudManager(data_dir="collected_data")
     app.state.manager = manager
-    t3 = asyncio.create_task(manager.run())
+    t4 = asyncio.create_task(manager.run())
     
     
     logger.info("✅ All services started")
@@ -59,7 +66,7 @@ async def lifespan(app: FastAPI):
     manager.stop()
     
     # Отменяем задачи
-    for t in [t1, t2, t3]:
+    for t in [t1, t2, t3, t4]:
         t.cancel()
         try:
             await t
@@ -95,6 +102,7 @@ async def health(request: Request):
     """Статус системы и всех компонентов."""
     b = request.app.state.binance
     by = request.app.state.bybit
+    g = request.app.state.gate
     m = request.app.state.manager
     
     return {
@@ -109,6 +117,11 @@ async def health(request: Request):
             "symbols": list(by.active_symbols),
             "buffer_stats": by.get_buffer_stats()
         },
+        "gate": {
+            "running": g.is_running,
+            "symbols": list(g.active_symbols),
+            "buffer_stats": g.get_buffer_stats()
+        },
         "cloud_manager": {
             "running": m.is_running,
             "local_files": m.get_local_files_stats()
@@ -121,6 +134,7 @@ async def stats(request: Request):
     """Детальная статистика системы."""
     b = request.app.state.binance
     by = request.app.state.bybit
+    g = request.app.state.gate
     m = request.app.state.manager
     
     local_stats = m.get_local_files_stats()
@@ -136,6 +150,11 @@ async def stats(request: Request):
                 "active_symbols": len(by.active_symbols),
                 "symbols": list(by.active_symbols),
                 "buffers": by.get_buffer_stats()
+            },
+            "gate": {
+                "active_symbols": len(g.active_symbols),
+                "symbols": list(g.active_symbols),
+                "buffers": g.get_buffer_stats()
             }
         },
         "storage": {
@@ -159,8 +178,10 @@ async def add_symbol(request: Request, body: SymbolRequest):
         await request.app.state.binance.add_symbol(body.symbol)
     elif exch == 'bybit':
         await request.app.state.bybit.add_symbol(body.symbol)
+    elif exch == 'gate':
+        await request.app.state.gate.add_symbol(body.symbol)
     else:
-        raise HTTPException(400, "Unknown exchange. Use 'binance' or 'bybit'")
+        raise HTTPException(400, "Unknown exchange. Use 'binance', 'bybit' or 'gate'")
     
     logger.info(f"➕ Added symbol: {exch}/{body.symbol}")
     
@@ -180,6 +201,8 @@ async def remove_symbol(request: Request, exchange: str, symbol: str):
         await request.app.state.binance.remove_symbol(symbol)
     elif exch == 'bybit':
         await request.app.state.bybit.remove_symbol(symbol)
+    elif exch == 'gate':
+        await request.app.state.gate.remove_symbol(symbol)
     else:
         raise HTTPException(400, "Unknown exchange")
     
@@ -197,10 +220,11 @@ async def list_symbols(request: Request):
     """Список всех активных символов."""
     b = request.app.state.binance
     by = request.app.state.bybit
-    
+    g = request.app.state.gate
     return {
         "binance": list(b.active_symbols),
-        "bybit": list(by.active_symbols)
+        "bybit": list(by.active_symbols),
+        "gate": list(g.active_symbols)
     }
 
 
@@ -215,7 +239,8 @@ async def force_upload(request: Request):
     # Сбрасываем буферы в файлы
     await request.app.state.binance.flush_memory()
     await request.app.state.bybit.flush_memory()
-    
+    await request.app.state.gate.flush_memory()
+
     # Загружаем файлы текущего часа в облако
     count = await request.app.state.manager.force_upload_current()
     
@@ -247,7 +272,9 @@ async def upload_symbol(request: Request, body: UploadRequest):
         await request.app.state.binance.flush_memory()
     elif body.exchange.lower() == 'bybit':
         await request.app.state.bybit.flush_memory()
-    
+    elif body.exchange.lower() == 'gate':
+        await request.app.state.gate.flush_memory()
+
     # Загружаем файлы символа
     count = await request.app.state.manager.force_upload_symbol(
         exchange=body.exchange,
@@ -280,7 +307,8 @@ async def upload_all(request: Request, delete_after: bool = False):
     # Сбрасываем все буферы
     await request.app.state.binance.flush_memory()
     await request.app.state.bybit.flush_memory()
-    
+    await request.app.state.gate.flush_memory()
+
     # Загружаем все файлы
     count = await request.app.state.manager.upload_all_files(
         delete_after=delete_after
