@@ -2,199 +2,99 @@ import asyncio
 from collections import deque
 import websockets
 import json
-import gzip
 import time
 import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Set, Dict, Optional
-import threading
+from typing import Set, Dict, Optional, List
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s', 
+    format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
 
-class BinanceCollector:
-    def __init__(self):
-        self.ws_url = "wss://fstream.binance.com/ws"
-        self.exchange = "binance"
-        self.active_symbols: Set[str] = set()
-        self.symbol_buffers: Dict[str, Dict[str, deque]] = {}
-        
-        self._buffer_lock = threading.Lock()
-        self.thread_pool = ThreadPoolExecutor(max_workers=4)
-        
-        self.is_running = False
-        self.logger = logging.getLogger("Binance")
-        self.subscription_lock = asyncio.Lock()
+class BinanceConnection:
+    """Одно WebSocket соединение к Binance."""
+    
+    def __init__(self, conn_id: str, parent: 'BinanceCollector'):
+        self.conn_id = conn_id
+        self.parent = parent
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        
-        self.data_dir = Path('collected_data')
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-
-    async def run(self):
-        self.loop = asyncio.get_running_loop()
-        self.is_running = True
-        self.logger.info("🚀 Starting Binance Collector")
-        
-        await asyncio.gather(
-            self._ws_listener(),
-            self._periodic_flush(),
-            return_exceptions=True
-        )
-
-    async def stop(self):
-        self.logger.info("🛑 Stopping...")
         self.is_running = False
-        await self.flush_memory()
-        if self.ws:
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
-        self.thread_pool.shutdown(wait=True)
-        self.logger.info("✅ Stopped, all data saved")
-
-    def _ws_connected(self) -> bool:
-        if self.ws is None:
-            return False
-        try:
-            return self.ws.close_code is None
-        except AttributeError:
-            return getattr(self.ws, 'open', False)
-
-    def get_status(self) -> dict:
-        """Статус для API endpoint."""
-        buffer_stats = {}
-        total_in_memory = 0
+        self.logger = logging.getLogger(f"Binance.{conn_id}")
         
-        with self._buffer_lock:
-            for symbol, buffers in self.symbol_buffers.items():
-                buffer_stats[symbol] = {
-                    data_type: len(buffers[data_type])
-                    for data_type in buffers
+        # Буферы для этого соединения
+        self.buffers: Dict[str, Dict[str, deque]] = {}
+        self._buffer_lock = asyncio.Lock()
+    
+    async def _init_symbol_buffers(self, symbol: str):
+        """Инициализирует буферы для символа."""
+        async with self._buffer_lock:
+            if symbol not in self.buffers:
+                self.buffers[symbol] = {
+                    "trades": deque(maxlen=50000),
+                    "bookticker": deque(maxlen=50000),
+                    "depth": deque(maxlen=25000)
                 }
-                total_in_memory += sum(len(buffers[t]) for t in buffers)
-        
-        return {
-            "is_running": self.is_running,
-            "ws_connected": self._ws_connected(),
-            "active_symbols": list(self.active_symbols),
-            "symbols_count": len(self.active_symbols),
-            "buffers": buffer_stats,
-            "total_in_memory": total_in_memory,
-        }
-
-    async def _periodic_flush(self):
-        while self.is_running:
-            await asyncio.sleep(5)
-            try:
-                await self.flush_memory()
-            except Exception as e:
-                self.logger.error(f"Flush error: {e}")
-
-    async def flush_memory(self):
-        """Атомарный swap буферов и запись на диск."""
-        flush_data = []
-        
-        with self._buffer_lock:
-            for symbol, buffers in self.symbol_buffers.items():
-                for data_type, buffer in buffers.items():
-                    if buffer:
-                        old_buffer = buffer
-                        buffers[data_type] = deque()
-                        flush_data.append((symbol, data_type, old_buffer))
-        
-        if not flush_data:
-            return
-        
-        tasks = [
-            self.loop.run_in_executor(
-                self.thread_pool,
-                self._write_gz,
-                symbol, dtype, list(messages)
-            )
-            for symbol, dtype, messages in flush_data
-        ]
-        
-        await asyncio.gather(*tasks, return_exceptions=True)
-        
-        total = sum(len(m) for _, _, m in flush_data)
-        self.logger.info(f"💾 Saved {total} messages")
-
-    def _write_gz(self, symbol: str, data_type: str, messages: list):
-        """Записывает в файл, группируя по часам."""
-        if not messages:
-            return
-        
-        # Группируем по часам из EventTime
-        hour_groups: Dict[str, list] = {}
-        for msg in messages:
-            try:
-                ts_ms = int(msg.split(',')[0])
-                hour = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y%m%d_%H")
-            except:
-                hour = datetime.now(timezone.utc).strftime("%Y%m%d_%H")
-            
-            if hour not in hour_groups:
-                hour_groups[hour] = []
-            hour_groups[hour].append(msg)
-        
-        # Пишем
-        for hour, msgs in hour_groups.items():
-            path = self.data_dir / f'{self.exchange}_{symbol}_{hour}_{data_type}.csv.gz'
-            with gzip.open(str(path), 'at', compresslevel=3) as f:
-                for m in msgs:
-                    f.write(m + "\n")
-
-    async def _ws_listener(self):
+    
+    async def run(self):
+        """Основной цикл соединения с автореконнектом."""
+        self.is_running = True
         reconnect_delay = 1
         
         while self.is_running:
             try:
                 async with websockets.connect(
-                    self.ws_url,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    self.parent.ws_url,
+                    ping_interval=None,
+                    max_size=10_000_000,
                 ) as ws:
                     self.ws = ws
                     reconnect_delay = 1
-                    self.logger.info("✅ Connected")
+                    self.logger.info(f"✅ Binance {self.conn_id} Connected")
                     
                     await self._subscribe_all()
                     
                     async for msg in ws:
                         if not self.is_running:
                             break
-                        self._parse(msg)
+                        await self._parse(msg)
                         
             except websockets.ConnectionClosed as e:
-                self.logger.warning(f"🔌 Disconnected: {e.code}")
+                self.logger.error(
+                    f"🔌 Binance {self.conn_id} Disconnected\n"
+                    f"  Code: {e.code}\n"
+                    f"  Reason: {e.reason or 'No reason provided'}",
+                    exc_info=True
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"WS error: {e}")
+                self.logger.error(
+                    f"Binance {self.conn_id} WS error: {type(e).__name__}: {e}",
+                    exc_info=True
+                )
             
             if self.is_running:
                 self.logger.info(f"🔄 Reconnect in {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
-
+    
     async def _subscribe_all(self):
-        if not self.active_symbols or not self._ws_connected():
+        """Подписывается на все активные символы."""
+        if not self.parent.active_symbols or not self._ws_connected():
             return
         
         streams = []
-        for s in self.active_symbols:
-            # Подписываемся на trades, bookTicker и depth20@100ms
+        for s in self.parent.active_symbols:
             streams.extend([
-                f"{s}@bookTicker", 
-                f"{s}@aggTrade",
-                f"{s}@depth20@100ms"  # depth20 с максимальной частотой
+                f"{s}@bookTicker",
+                f"{s}@trade",
+                f"{s}@depth20@100ms"
             ])
         
         await self.ws.send(json.dumps({
@@ -202,144 +102,361 @@ class BinanceCollector:
             'params': streams,
             'id': 1
         }))
-        self.logger.info(f"📡 Subscribed: {len(self.active_symbols)} symbols x 3 streams")
-
-    def _parse(self, raw: str):
+        self.logger.info(f"📡 Subscribed: {len(self.parent.active_symbols)} symbols")
+    
+    def _ws_connected(self) -> bool:
+        if self.ws is None:
+            return False
+        try:
+            return self.ws.close_code is None
+        except AttributeError:
+            return getattr(self.ws, 'open', False)
+    
+    async def _parse(self, raw: str):
+        """Парсит сообщения от биржи и складывает в буферы."""
         try:
             data = json.loads(raw)
             
-            # Системные ответы — пропускаем
             if "result" in data:
                 return
             
             sym = data.get("s", "").lower()
-            if not sym or sym not in self.symbol_buffers:
+            if not sym:
                 return
             
             event_type = data.get("e")
             
-            # aggTrade
-            if event_type == "aggTrade":
-                mk = "1" if data.get("m") else "0"
-                line = f'{data["E"]},{data["a"]},{data["p"]},{data["q"]},{data["T"]},{mk}'
-                self.symbol_buffers[sym]["trades"].append(line)
+            async with self._buffer_lock:
+                if sym not in self.buffers:
+                    return
+                buffers = self.buffers[sym]
             
-            # bookTicker (BBO)
+            if event_type == "trade":
+                trade = {
+                    'timestamp_ms': data["E"],
+                    'connection_id': self.conn_id,
+                    'trade_id': data["t"],
+                    'price': float(data["p"]),
+                    'qty': float(data["q"]),
+                    'trade_time_ms': data["T"],
+                    'is_buyer_maker': data["m"],
+                }
+                buffers["trades"].append(trade)
+            
             elif event_type == "bookTicker":
-                # Правильное условие для bookTicker
-                et = data.get("E", int(time.time() * 1000))
-                line = f'{et},{data["u"]},{data["b"]},{data["B"]},{data["a"]},{data["A"]}'
-                self.symbol_buffers[sym]["orderbook"].append(line)
+                bbo = {
+                    'timestamp_ms': data.get("E", int(time.time_ns() // 1_000_000)),
+                    'connection_id': self.conn_id,
+                    'update_id': data["u"],
+                    'best_bid_price': float(data["b"]),
+                    'best_bid_qty': float(data["B"]),
+                    'best_ask_price': float(data["a"]),
+                    'best_ask_qty': float(data["A"])
+                }
+                buffers["bookticker"].append(bbo)
             
-            # depthUpdate (Partial Book Depth)
             elif event_type == "depthUpdate":
-                bids = "|".join(f"{p}:{q}" for p, q in data.get("b", []))
-                asks = "|".join(f"{p}:{q}" for p, q in data.get("a", []))
-                line = f'{data["E"]},{data["T"]},{data["u"]},{bids},{asks}'
-                self.symbol_buffers[sym]["depth"].append(line)
+                bids = [[float(p), float(q)] for p, q in data.get("b", [])]
+                asks = [[float(p), float(q)] for p, q in data.get("a", [])]
                 
+                depth = {
+                    'timestamp_ms': data["E"],
+                    'connection_id': self.conn_id,
+                    'update_id': data["u"],
+                    'bids': bids,
+                    'asks': asks
+                }
+                buffers["depth"].append(depth)
+                    
         except Exception as e:
             self.logger.debug(f"Parse error: {e}")
+    
+    async def stop(self):
+        """Останавливает соединение."""
+        self.is_running = False
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+
+
+class BinanceCollector:
+    """Коллектор с множественными соединениями."""
+    
+    def __init__(self, num_connections: int = 2, max_workers: int = 8):
+        self.ws_url = "wss://fstream.binance.com/ws"
+        self.exchange = "binance"
+        self.num_connections = num_connections
+        self.connections: List[BinanceConnection] = []
+        
+        self.active_symbols: Set[str] = set()
+        self.symbol_lock = asyncio.Lock()
+        
+        self.is_running = False
+        self.logger = logging.getLogger("BinanceCollector")
+        
+        self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
+        
+        self.data_dir = Path('collected_data') / self.exchange
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        
+        self._write_semaphore = asyncio.Semaphore(max_workers)
+        
+        for i in range(num_connections):
+            conn = BinanceConnection(f"conn_{i+1}", self)
+            self.connections.append(conn)
+    
+    async def run(self):
+        """Запускает все соединения и фоновые задачи."""
+        self.is_running = True
+        self.logger.info(f"🚀 Starting {self.num_connections} connections")
+        
+        tasks = [
+            *[conn.run() for conn in self.connections],
+            self._periodic_flush()
+        ]
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    async def stop(self):
+        """Останавливает все соединения."""
+        self.logger.info("🛑 Stopping...")
+        self.is_running = False
+        
+        await asyncio.gather(*[conn.stop() for conn in self.connections])
+        
+        await self.flush_all()
+        
+        self.thread_pool.shutdown(wait=True)
+        self.logger.info("✅ Stopped")
+    
+    async def _periodic_flush(self):
+        """Периодически сбрасывает буферы на диск."""
+        while self.is_running:
+            await asyncio.sleep(5)
+            try:
+                await self.flush_all()
+            except Exception as e:
+                self.logger.error(f"Flush error: {e}")
+    
+    async def flush_all(self):
+        """Сбрасывает буферы БЕЗ длительной блокировки."""
+        flush_tasks = []
+        
+        for conn in self.connections:
+            batches = {}
+            async with conn._buffer_lock:
+                for symbol, buffers in conn.buffers.items():
+                    batches[symbol] = {}
+                    for data_type, buffer in buffers.items():
+                        if buffer:
+                            batches[symbol][data_type] = list(buffer)
+                            buffer.clear()
+            
+            for symbol, data_types in batches.items():
+                for data_type, data_list in data_types.items():
+                    if data_list:
+                        task = self._write_with_semaphore(
+                            symbol, data_type, conn.conn_id, data_list
+                        )
+                        flush_tasks.append(task)
+        
+        if flush_tasks:
+            results = await asyncio.gather(*flush_tasks, return_exceptions=True)
+            errors = [r for r in results if isinstance(r, Exception)]
+            if errors:
+                self.logger.error(f"Flush errors: {len(errors)}")
+            else:
+                self.logger.info(f"💾 Flushed {len(flush_tasks)} buffers")
+    
+    async def _write_with_semaphore(self, symbol: str, data_type: str, 
+                                    conn_id: str, data: List[dict]):
+        """Запись с ограничением параллелизма."""
+        async with self._write_semaphore:
+            return await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool,
+                self._write_parquet,
+                symbol, data_type, conn_id, data
+            )
+    
+    def _write_parquet(self, symbol: str, data_type: str, conn_id: str, data: List[dict]):
+        """Атомарная запись с .tmp файлом."""
+        if not data:
+            return
+        
+        now = datetime.now(timezone.utc)
+        symbol_dir = self.data_dir / symbol / now.strftime("%Y%m%d_%H")
+        symbol_dir.mkdir(parents=True, exist_ok=True)
+        
+        final_filepath = symbol_dir / f"{conn_id}_{data_type}.parquet"
+        temp_filepath = symbol_dir / f"{conn_id}_{data_type}.parquet.tmp"
+        
+        schema = self._get_schema(data_type)
+        if not schema:
+            return
+        
+        try:
+            new_table = pa.Table.from_pylist(data, schema=schema)
+            
+            if final_filepath.exists():
+                existing = pq.read_table(final_filepath)
+                combined = pa.concat_tables([existing, new_table])
+                
+                pq.write_table(
+                    combined,
+                    temp_filepath,
+                    compression='zstd',
+                    compression_level=3
+                )
+            else:
+                pq.write_table(
+                    new_table,
+                    temp_filepath,
+                    compression='zstd',
+                    compression_level=3
+                )
+            
+            temp_filepath.replace(final_filepath)
+            
+        except Exception as e:
+            self.logger.error(f"Parquet write error for {final_filepath}: {e}")
+            if temp_filepath.exists():
+                temp_filepath.unlink()
+    
+    def _get_schema(self, data_type: str) -> Optional[pa.Schema]:
+        """Возвращает схему по типу данных."""
+        schemas = {
+            'depth': self._get_depth_schema(),
+            'trades': self._get_trades_schema(),
+            'bookticker': self._get_bookticker_schema()
+        }
+        return schemas.get(data_type)
+    
+    @staticmethod
+    def _get_depth_schema() -> pa.Schema:
+        """Схема для depth - двумерные массивы [[price, qty], ...]."""
+        return pa.schema([
+            ('timestamp_ms', pa.int64()),
+            ('connection_id', pa.string()),
+            ('update_id', pa.int64()),
+            ('bids', pa.list_(pa.list_(pa.float64(), 2))),
+            ('asks', pa.list_(pa.list_(pa.float64(), 2)))
+        ])
+    
+    @staticmethod
+    def _get_trades_schema() -> pa.Schema:
+        return pa.schema([
+            ('timestamp_ms', pa.int64()),
+            ('connection_id', pa.string()),
+            ('trade_id', pa.int64()),
+            ('price', pa.float64()),
+            ('qty', pa.float64()),
+            ('trade_time_ms', pa.int64()),
+            ('is_buyer_maker', pa.bool_()),
+        ])
+    
+    @staticmethod
+    def _get_bookticker_schema() -> pa.Schema:
+        return pa.schema([
+            ('timestamp_ms', pa.int64()),
+            ('connection_id', pa.string()),
+            ('update_id', pa.int64()),
+            ('best_bid_price', pa.float64()),
+            ('best_bid_qty', pa.float64()),
+            ('best_ask_price', pa.float64()),
+            ('best_ask_qty', pa.float64())
+        ])
+    
     async def add_symbol(self, symbol: str):
+        """Добавляет символ к подписке."""
         s = symbol.lower()
         
-        async with self.subscription_lock:
+        async with self.symbol_lock:
             if s in self.active_symbols:
                 return
             
             self.active_symbols.add(s)
             
-            with self._buffer_lock:
-                self.symbol_buffers[s] = {
-                    "trades": deque(),       # aggTrades
-                    "orderbook": deque(),    # bookTicker (BBO)
-                    "depth": deque()         # depth20 (стакан)
-                }
+            for conn in self.connections:
+                await conn._init_symbol_buffers(s)
             
-            # Подписываемся на все потоки
-            if self._ws_connected():
-                await self.ws.send(json.dumps({
-                    'method': 'SUBSCRIBE',
-                    'params': [
-                        f"{s}@bookTicker",
-                        f"{s}@aggTrade",
-                        f"{s}@depth20@100ms"  # 20 уровней, 100ms
-                    ],
-                    'id': 1
-                }))
+            for conn in self.connections:
+                if conn._ws_connected():
+                    await conn.ws.send(json.dumps({
+                        'method': 'SUBSCRIBE',
+                        'params': [
+                            f"{s}@bookTicker",
+                            f"{s}@trade",
+                            f"{s}@depth20@100ms"
+                        ],
+                        'id': 1
+                    }))
             
             self.logger.info(f"➕ Added: {s}")
-
+    
     async def remove_symbol(self, symbol: str):
+        """Удаляет символ из подписки."""
         s = symbol.lower()
         
-        async with self.subscription_lock:
+        async with self.symbol_lock:
             if s not in self.active_symbols:
                 return
             
-            if self._ws_connected():
-                await self.ws.send(json.dumps({
-                    'method': 'UNSUBSCRIBE',
-                    'params': [
-                        f"{s}@bookTicker",
-                        f"{s}@aggTrade",
-                        f"{s}@depth20@100ms"
-                    ],
-                    'id': 1
-                }))
+            for conn in self.connections:
+                if conn._ws_connected():
+                    await conn.ws.send(json.dumps({
+                        'method': 'UNSUBSCRIBE',
+                        'params': [
+                            f"{s}@bookTicker",
+                            f"{s}@trade",
+                            f"{s}@depth20@100ms"
+                        ],
+                        'id': 1
+                    }))
             
-            await self.flush_memory()
-            
+            await self.flush_all()
             self.active_symbols.discard(s)
-            with self._buffer_lock:
-                self.symbol_buffers.pop(s, None)
             
             self.logger.info(f"➖ Removed: {s}")
-
-
-# Код для чтения depth20 данных
-def parse_depth(line: str) -> dict:
-    """Парсит строку depth20 в словарь с данными."""
-    parts = line.strip().split(',')
-    event_time = int(parts[0])
-    trans_time = int(parts[1])
-    update_id = int(parts[2])
     
-    # Парсим bids (цена:количество)
-    bids = []
-    if parts[3]:
-        for level in parts[3].split('|'):
-            price, qty = level.split(':')
-            bids.append([float(price), float(qty)])
+    async def get_status(self) -> dict:
+        """Возвращает статус коллектора."""
+        connections_status = []
+        for conn in self.connections:
+            buffer_counts = {}
+            async with conn._buffer_lock:
+                for symbol, buffers in conn.buffers.items():
+                    buffer_counts[symbol] = {
+                        dt: len(buf) for dt, buf in buffers.items()
+                    }
+            
+            connections_status.append({
+                'id': conn.conn_id,
+                'connected': conn._ws_connected(),
+                'buffers': buffer_counts
+            })
+        
+        return {
+            'is_running': self.is_running,
+            'active_symbols': list(self.active_symbols),
+            'connections': connections_status
+        }
+
+
+async def main():
+    collector = BinanceCollector(num_connections=2, max_workers=8)
     
-    # Парсим asks (цена:количество)
-    asks = []
-    if parts[4]:
-        for level in parts[4].split('|'):
-            price, qty = level.split(':')
-            asks.append([float(price), float(qty)])
+    await collector.add_symbol("btcusdt")
+    await collector.add_symbol("ethusdt")
     
-    return {
-        'event_time': event_time,
-        'trans_time': trans_time,
-        'update_id': update_id,
-        'bids': bids,
-        'asks': asks
-    }
+    try:
+        await collector.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await collector.stop()
 
 
-# async def main():
-#     collector = BinanceCollector()
-#     await collector.add_symbol("btcusdt")
-#     await collector.add_symbol("ethusdt")
-    
-#     try:
-#         await collector.run()
-#     except KeyboardInterrupt:
-#         pass
-#     finally:
-#         await collector.stop()
-
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
