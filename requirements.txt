@@ -5,3 +5,5 @@ aiohttp
 orjson
 boto3
 websockets
+pyarrow
+pydantic
