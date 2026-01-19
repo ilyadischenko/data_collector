@@ -7,3 +7,4 @@ boto3
 websockets
 pyarrow
 pydantic
+pandas
