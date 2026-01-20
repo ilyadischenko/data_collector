@@ -3,8 +3,11 @@ import logging
 from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
+
 from pydantic import BaseModel
 from typing import List, Optional
+
+from routes import router as data_router
 
 
 # Импорты наших модулей
@@ -25,6 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MainAPI")
 
+# После создания app
 
 # ==================== Lifecycle ====================
 
@@ -63,7 +67,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.manager_gate = manager_gate
     t4 = asyncio.create_task(manager_gate.run())
-    
+
     logger.info("✅ All services started")
         
     yield
@@ -91,9 +95,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="HFT Data Collector", lifespan=lifespan)
+app.include_router(data_router, prefix="/api", tags=["Data Access"])
 
 # Подключаем роуты для выгрузки данных
-app.include_router(data_router)
+# app.include_router(data_router)
 
 
 # ==================== Models ====================

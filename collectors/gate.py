@@ -192,7 +192,6 @@ class GateConnection:
                     'trade_id': item['id'],
                     'price': float(item['price']),
                     'qty': float(item['size']),
-                    'trade_time_ms': item.get('create_time_ms', timestamp_ms),
                 }
                 buffers["trades"].append(trade)
             
@@ -453,7 +452,6 @@ class GateCollector:
             ('trade_id', pa.int64()),
             ('price', pa.float64()),
             ('qty', pa.float64()),
-            ('trade_time_ms', pa.int64()),
         ])
     
     @staticmethod

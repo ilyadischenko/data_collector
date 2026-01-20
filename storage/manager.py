@@ -196,7 +196,7 @@ class CloudManager:
         data_type: str,
         symbol: str
     ) -> Optional[Path]:
-        """Синхронное объединение с дедупликацией."""
+        """Синхронное объединение с дедупликацией и нормализацией."""
         try:
             tables = []
             total_rows = 0
@@ -239,11 +239,23 @@ class CloudManager:
                 )
             
             df = df.sort_values('timestamp_ms').reset_index(drop=True)
+            
+            # УДАЛЯЕМ connection_id из всех типов данных
+            if 'connection_id' in df.columns:
+                df = df.drop(columns=['connection_id'])
+                self.logger.debug(f"Removed connection_id from {data_type}")
+            
+            # Трансформация для приведения к единому формату
+            if data_type == "trades":
+                df = self._normalize_trades(df, symbol)
+            
             merged_table = pa.Table.from_pandas(df, preserve_index=False)
             
-            # Трансформация trades для Binance
-            if data_type == "trades" and self.exchange == "binance":
-                merged_table = self._transform_binance_trades(merged_table)
+            # Получаем финальную схему (без connection_id)
+            final_schema = self._get_final_schema(data_type)
+            
+            # Приводим таблицу к финальной схеме
+            merged_table = merged_table.cast(final_schema)
             
             # Запись с атомарной заменой
             merged_path = hour_dir / f"merged_{data_type}.parquet"
@@ -280,51 +292,64 @@ class CloudManager:
                 temp_path.unlink()
             return None
 
-    def _transform_binance_trades(self, table: pa.Table) -> pa.Table:
-        """Трансформирует таблицу trades для Binance."""
-        try:
-            if 'is_buyer_maker' not in table.column_names:
-                self.logger.warning("Field 'is_buyer_maker' not found, skipping transformation")
-                return table
-            
-            qty = table['qty']
-            is_buyer_maker = table['is_buyer_maker']
-            
-            signed_qty = pc.if_else(
-                is_buyer_maker,
-                pc.negate(qty),
-                qty
-            )
-            
-            new_fields = []
-            for field in table.schema:
-                if field.name != 'is_buyer_maker':
-                    new_fields.append(field)
-            new_schema = pa.schema(new_fields)
-            
-            columns = []
-            for field in new_schema:
-                if field.name == 'qty':
-                    columns.append(signed_qty)
-                else:
-                    columns.append(table[field.name])
-            
-            transformed_table = pa.Table.from_arrays(columns, schema=new_schema)
-            
-            sell_count = pc.sum(is_buyer_maker).as_py()
-            buy_count = len(table) - sell_count
-            
-            self.logger.info(
-                f"Transformed Binance trades: {len(table)} rows "
-                f"(buys: {buy_count}, sells: {sell_count})"
-            )
-            
-            return transformed_table
-            
-        except Exception as e:
-            self.logger.error(f"❌ Binance trade transformation failed: {e}")
-            return table
+    def _normalize_trades(self, df, symbol: str):
+        """
+        Нормализует trades к единому формату:
+        - qty: знаковый float (+ buy, - sell)
+        - удаляет is_buyer_maker для Binance
+        """
+        if self.exchange == "binance":
+            if 'is_buyer_maker' in df.columns:
+                # is_buyer_maker=True означает taker купил → qty отрицательный
+                df.loc[df['is_buyer_maker'] == True, 'qty'] = -df.loc[df['is_buyer_maker'] == True, 'qty']
+                df = df.drop(columns=['is_buyer_maker'])
+                
+                sell_count = (df['qty'] < 0).sum()
+                buy_count = (df['qty'] > 0).sum()
+                
+                self.logger.info(
+                    f"   Normalized Binance trades: {len(df)} rows "
+                    f"(buys: {buy_count}, sells: {sell_count})"
+                )
+        
+        # Gate.io уже приходит со знаковым qty - ничего не делаем
+        
+        return df
 
+    def _get_final_schema(self, data_type: str) -> pa.Schema:
+        """
+        Возвращает ФИНАЛЬНУЮ схему для merged файлов (БЕЗ connection_id).
+        Единая для всех бирж.
+        """
+        if data_type == 'trades':
+            return pa.schema([
+                ('timestamp_ms', pa.int64()),
+                ('trade_id', pa.int64()),
+                ('price', pa.float64()),
+                ('qty', pa.float64()),  # Знаковый: + buy, - sell
+            ])
+        
+        elif data_type == 'bookticker':
+            return pa.schema([
+                ('timestamp_ms', pa.int64()),
+                ('update_id', pa.int64()),
+                ('best_bid_price', pa.float64()),
+                ('best_bid_qty', pa.float64()),
+                ('best_ask_price', pa.float64()),
+                ('best_ask_qty', pa.float64())
+            ])
+        
+        elif data_type == 'depth':
+            return pa.schema([
+                ('timestamp_ms', pa.int64()),
+                ('update_id', pa.int64()),
+                ('bids', pa.list_(pa.list_(pa.float64(), 2))),
+                ('asks', pa.list_(pa.list_(pa.float64(), 2)))
+            ])
+        
+        else:
+            raise ValueError(f"Unknown data_type: {data_type}")
+        
     async def compress_file_gzip(self, file_path: Path) -> Optional[Path]:
         """Асинхронное GZIP сжатие через executor."""
         if not file_path.exists():

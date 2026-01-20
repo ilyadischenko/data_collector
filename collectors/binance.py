@@ -131,12 +131,11 @@ class BinanceConnection:
             
             if event_type == "trade":
                 trade = {
-                    'timestamp_ms': data["E"],
+                    'timestamp_ms': data["E"],  # Exchange time
                     'connection_id': self.conn_id,
                     'trade_id': data["t"],
                     'price': float(data["p"]),
                     'qty': float(data["q"]),
-                    'trade_time_ms': data["T"],
                     'is_buyer_maker': data["m"],
                 }
                 buffers["trades"].append(trade)
@@ -398,7 +397,6 @@ class BinanceCollector:
             ('trade_id', pa.int64()),
             ('price', pa.float64()),
             ('qty', pa.float64()),
-            ('trade_time_ms', pa.int64()),
             ('is_buyer_maker', pa.bool_()),
         ])
     
