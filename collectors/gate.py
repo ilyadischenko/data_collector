@@ -27,42 +27,30 @@ class GateConnection:
         self.is_running = False
         self.logger = logging.getLogger(f"Gate.{conn_id}")
         
-        # Буферы для этого соединения
+        # Простые буферы: {symbol: {data_type: deque}}
         self.buffers: Dict[str, Dict[str, deque]] = {}
         self._buffer_lock = asyncio.Lock()
     
-    async def _init_symbol_buffers(self, symbol: str):
-        """Инициализирует буферы для символа."""
-        async with self._buffer_lock:
-            if symbol not in self.buffers:
-                self.buffers[symbol] = {
-                    "trades": deque(maxlen=50000),
-                    "bookticker": deque(maxlen=50000),
-                    "depth": deque(maxlen=25000)
-                }
-    
     def _normalize_symbol(self, gate_symbol: str) -> str:
-        """
-        Преобразует символ Gate.io в нормализованный формат.
-        
-        Gate.io: BTC_USDT -> btcusdt
-        Для обратной совместимости с Binance данными.
-        """
+        """Gate.io: BTC_USDT -> btcusdt"""
         return gate_symbol.replace('_', '').lower()
     
     def _to_gate_symbol(self, normalized_symbol: str) -> str:
-        """
-        Преобразует нормализованный символ в формат Gate.io.
-        
-        btcusdt -> BTC_USDT
-        ethusdt -> ETH_USDT
-        """
-        # Убираем 'usdt' в конце и добавляем подчеркивание
+        """btcusdt -> BTC_USDT"""
         if normalized_symbol.endswith('usdt'):
             base = normalized_symbol[:-4].upper()
             return f"{base}_USDT"
-        # Для других пар можно добавить логику
         return normalized_symbol.upper()
+    
+    async def _ensure_symbol_buffer(self, symbol: str):
+        """Создает буферы для символа если их нет."""
+        async with self._buffer_lock:
+            if symbol not in self.buffers:
+                self.buffers[symbol] = {
+                    "trades": deque(),
+                    "bookticker": deque(),
+                    "depth": deque()
+                }
     
     async def run(self):
         """Основной цикл соединения с автореконнектом."""
@@ -89,18 +77,12 @@ class GateConnection:
                         
             except websockets.ConnectionClosed as e:
                 self.logger.error(
-                    f"🔌 Gate {self.conn_id} Disconnected\n"
-                    f"  Code: {e.code}\n"
-                    f"  Reason: {e.reason or 'No reason provided'}",
-                    exc_info=True
+                    f"🔌 Gate {self.conn_id} Disconnected: {e.code} - {e.reason or 'No reason'}"
                 )
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(
-                    f"Gate {self.conn_id} WS error: {type(e).__name__}: {e}",
-                    exc_info=True
-                )
+                self.logger.error(f"Gate {self.conn_id} WS error: {e}", exc_info=True)
             
             if self.is_running:
                 self.logger.info(f"🔄 Reconnect in {reconnect_delay}s")
@@ -112,11 +94,9 @@ class GateConnection:
         if not self.parent.active_symbols or not self._ws_connected():
             return
         
-        # Gate.io использует отдельные подписки для каждого канала
         for s in self.parent.active_symbols:
             gate_symbol = self._to_gate_symbol(s)
             
-            # Подписка на trades
             await self.ws.send(json.dumps({
                 'time': int(time.time()),
                 'channel': 'futures.trades',
@@ -124,7 +104,6 @@ class GateConnection:
                 'payload': [gate_symbol]
             }))
             
-            # Подписка на book ticker (BBO)
             await self.ws.send(json.dumps({
                 'time': int(time.time()),
                 'channel': 'futures.book_ticker',
@@ -132,13 +111,11 @@ class GateConnection:
                 'payload': [gate_symbol]
             }))
             
-            # ИСПРАВЛЕНО: подписка на полные снимки ордербука (не инкрементальные апдейты)
-            # interval="0" означает максимальную частоту обновлений
             await self.ws.send(json.dumps({
                 'time': int(time.time()),
                 'channel': 'futures.order_book',
                 'event': 'subscribe',
-                'payload': [gate_symbol, "20", "0"]  # 20 уровней, "0" = максимальная частота
+                'payload': [gate_symbol, "20", "0"]
             }))
         
         self.logger.info(f"📡 Subscribed: {len(self.parent.active_symbols)} symbols")
@@ -156,14 +133,12 @@ class GateConnection:
         try:
             data = json.loads(raw)
             
-            # Пропускаем служебные сообщения
             if 'event' in data and data['event'] == 'subscribe':
                 return
             
             channel = data.get('channel', '')
             event = data.get('event', '')
             
-            # ИСПРАВЛЕНО: order_book использует event="all", остальные каналы "update"
             if channel == 'futures.order_book':
                 if event != 'all':
                     return
@@ -175,13 +150,13 @@ class GateConnection:
             if not result:
                 return
             
-            # Gate.io может отдавать список результатов (для trades, bookticker)
-            # Для order_book result - это один объект
             if not isinstance(result, list):
                 result = [result]
             
+            timestamp_ms = data.get('time_ms', int(time.time() * 1000))
+            
             for item in result:
-                await self._process_item(channel, item, data.get('time_ms', int(time.time() * 1000)))
+                await self._process_item(channel, item, timestamp_ms)
                     
         except Exception as e:
             self.logger.debug(f"Parse error: {e}")
@@ -189,22 +164,21 @@ class GateConnection:
     async def _process_item(self, channel: str, item: dict, timestamp_ms: int):
         """Обрабатывает один элемент данных."""
         try:
-            # ИСПРАВЛЕНО: получаем символ в зависимости от канала
             if channel == 'futures.trades':
                 gate_symbol = item.get('contract')
             elif channel == 'futures.book_ticker':
                 gate_symbol = item.get('s')
             elif channel == 'futures.order_book':
-                gate_symbol = item.get('contract')  # ИСПРАВЛЕНО: для order_book используется 'contract'
+                gate_symbol = item.get('contract')
             else:
                 return
             
             if not gate_symbol:
-                self.logger.warning(f"Missing symbol in {channel}: {item.keys()}")
                 return
             
-            # Нормализуем символ для хранения
             normalized_symbol = self._normalize_symbol(gate_symbol)
+            
+            await self._ensure_symbol_buffer(normalized_symbol)
             
             async with self._buffer_lock:
                 if normalized_symbol not in self.buffers:
@@ -212,25 +186,21 @@ class GateConnection:
                 buffers = self.buffers[normalized_symbol]
             
             if channel == 'futures.trades':
-                # Gate.io уже отдаёт signed size:
-                # Positive size = taker is buyer (покупка)
-                # Negative size = taker is seller (продажа)
                 trade = {
                     'timestamp_ms': item.get('create_time_ms', timestamp_ms),
                     'connection_id': self.conn_id,
                     'trade_id': item['id'],
                     'price': float(item['price']),
-                    'qty': float(item['size']),  # УЖЕ со знаком!
+                    'qty': float(item['size']),
                     'trade_time_ms': item.get('create_time_ms', timestamp_ms),
                 }
                 buffers["trades"].append(trade)
             
             elif channel == 'futures.book_ticker':
-                # Best bid/ask
                 bbo = {
                     'timestamp_ms': timestamp_ms,
                     'connection_id': self.conn_id,
-                    'update_id': item.get('u', 0),  # Gate может не отдавать update_id для BBO
+                    'update_id': item.get('u', 0),
                     'best_bid_price': float(item['b']),
                     'best_bid_qty': float(item['B']),
                     'best_ask_price': float(item['a']),
@@ -239,19 +209,16 @@ class GateConnection:
                 buffers["bookticker"].append(bbo)
             
             elif channel == 'futures.order_book':
-                # ИСПРАВЛЕНО: обработка полных снимков ордербука
-                # Gate.io формат: asks/bids как [{p: price, s: size}, ...]
                 asks_raw = item.get('asks', [])
                 bids_raw = item.get('bids', [])
                 
-                # ИСПРАВЛЕНО: преобразуем из {p, s} в [[price, size], ...]
                 asks = [[float(level['p']), abs(float(level['s']))] for level in asks_raw]
                 bids = [[float(level['p']), abs(float(level['s']))] for level in bids_raw]
                 
                 depth = {
-                    'timestamp_ms': item.get('t', timestamp_ms),  # Gate отдаёт 't' для timestamp
+                    'timestamp_ms': item.get('t', timestamp_ms),
                     'connection_id': self.conn_id,
-                    'update_id': item.get('id', 0),  # ИСПРАВЛЕНО: orderbook id
+                    'update_id': item.get('id', 0),
                     'bids': bids,
                     'asks': asks
                 }
@@ -259,6 +226,23 @@ class GateConnection:
                     
         except Exception as e:
             self.logger.debug(f"Process item error for {channel}: {e}")
+    
+    async def get_snapshot_and_clear(self) -> Dict[str, Dict[str, List[dict]]]:
+        """
+        Создает снимок ВСЕХ буферов и очищает их.
+        Возвращает: {symbol: {data_type: [data]}}
+        """
+        result = {}
+        
+        async with self._buffer_lock:
+            for symbol, buffers in self.buffers.items():
+                result[symbol] = {}
+                for data_type, buffer in buffers.items():
+                    if buffer:
+                        result[symbol][data_type] = list(buffer)
+                        buffer.clear()
+        
+        return result
     
     async def stop(self):
         """Останавливает соединение."""
@@ -268,6 +252,15 @@ class GateConnection:
                 await self.ws.close()
             except Exception:
                 pass
+    
+    def get_buffer_stats(self) -> dict:
+        """Возвращает статистику буферов."""
+        stats = {}
+        for symbol, buffers in self.buffers.items():
+            stats[symbol] = {
+                dt: len(buf) for dt, buf in buffers.items()
+            }
+        return stats
 
 
 class GateCollector:
@@ -303,7 +296,7 @@ class GateCollector:
         
         tasks = [
             *[conn.run() for conn in self.connections],
-            self._periodic_flush()
+            self._writer_task()
         ]
         
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -315,67 +308,87 @@ class GateCollector:
         
         await asyncio.gather(*[conn.stop() for conn in self.connections])
         
-        await self.flush_all()
+        # Финальный сброс всех буферов
+        await self._flush_all()
         
         self.thread_pool.shutdown(wait=True)
         self.logger.info("✅ Stopped")
     
-    async def _periodic_flush(self):
-        """Периодически сбрасывает буферы на диск."""
+    async def _writer_task(self):
+        """Задача записи: каждые 5 сек берет буферы и пишет в файлы."""
         while self.is_running:
             await asyncio.sleep(5)
+            
             try:
-                await self.flush_all()
+                await self._flush_all()
             except Exception as e:
-                self.logger.error(f"Flush error: {e}")
+                self.logger.error(f"Writer task error: {e}", exc_info=True)
     
-    async def flush_all(self):
-        """Сбрасывает буферы БЕЗ длительной блокировки."""
+    async def _flush_all(self):
+        """Берет snapshot всех буферов и распределяет по файлам."""
         flush_tasks = []
         
         for conn in self.connections:
-            batches = {}
-            async with conn._buffer_lock:
-                for symbol, buffers in conn.buffers.items():
-                    batches[symbol] = {}
-                    for data_type, buffer in buffers.items():
-                        if buffer:
-                            batches[symbol][data_type] = list(buffer)
-                            buffer.clear()
+            snapshot = await conn.get_snapshot_and_clear()
             
-            for symbol, data_types in batches.items():
+            for symbol, data_types in snapshot.items():
                 for data_type, data_list in data_types.items():
                     if data_list:
-                        task = self._write_with_semaphore(
-                            symbol, data_type, conn.conn_id, data_list
-                        )
-                        flush_tasks.append(task)
+                        # Группируем по часам
+                        hourly_data = self._group_by_hour(data_list)
+                        
+                        # Пишем каждый час в отдельный файл
+                        for hour_key, hour_data in hourly_data.items():
+                            task = self._write_with_semaphore(
+                                symbol, data_type, conn.conn_id, hour_data, hour_key
+                            )
+                            flush_tasks.append(task)
         
         if flush_tasks:
             results = await asyncio.gather(*flush_tasks, return_exceptions=True)
             errors = [r for r in results if isinstance(r, Exception)]
             if errors:
-                self.logger.error(f"Flush errors: {len(errors)}")
-            else:
-                self.logger.info(f"💾 Flushed {len(flush_tasks)} buffers")
+                self.logger.error(f"Flush errors: {len(errors)}/{len(flush_tasks)}")
+    
+    def _group_by_hour(self, data_list: List[dict]) -> Dict[str, List[dict]]:
+        """
+        Группирует данные по часам на основе timestamp_ms.
+        Возвращает: {hour_key: [data]}
+        """
+        hourly_data = {}
+        
+        for item in data_list:
+            timestamp_ms = item.get('timestamp_ms')
+            if not timestamp_ms:
+                continue
+            
+            dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+            hour_key = dt.strftime("%Y%m%d_%H")
+            
+            if hour_key not in hourly_data:
+                hourly_data[hour_key] = []
+            
+            hourly_data[hour_key].append(item)
+        
+        return hourly_data
     
     async def _write_with_semaphore(self, symbol: str, data_type: str, 
-                                    conn_id: str, data: List[dict]):
+                                    conn_id: str, data: List[dict], hour_key: str):
         """Запись с ограничением параллелизма."""
         async with self._write_semaphore:
             return await asyncio.get_event_loop().run_in_executor(
                 self.thread_pool,
                 self._write_parquet,
-                symbol, data_type, conn_id, data
+                symbol, data_type, conn_id, data, hour_key
             )
     
-    def _write_parquet(self, symbol: str, data_type: str, conn_id: str, data: List[dict]):
+    def _write_parquet(self, symbol: str, data_type: str, conn_id: str, 
+                      data: List[dict], hour_key: str):
         """Атомарная запись с .tmp файлом."""
         if not data:
             return
         
-        now = datetime.now(timezone.utc)
-        symbol_dir = self.data_dir / symbol / now.strftime("%Y%m%d_%H")
+        symbol_dir = self.data_dir / symbol / hour_key
         symbol_dir.mkdir(parents=True, exist_ok=True)
         
         final_filepath = symbol_dir / f"{conn_id}_{data_type}.parquet"
@@ -424,7 +437,6 @@ class GateCollector:
     
     @staticmethod
     def _get_depth_schema() -> pa.Schema:
-        """Схема для depth - двумерные массивы [[price, qty], ...]."""
         return pa.schema([
             ('timestamp_ms', pa.int64()),
             ('connection_id', pa.string()),
@@ -435,18 +447,12 @@ class GateCollector:
     
     @staticmethod
     def _get_trades_schema() -> pa.Schema:
-        """
-        Схема для trades.
-        
-        ВАЖНО: qty уже со знаком (positive = buy, negative = sell).
-        Поле is_buyer_maker не хранится, как и в Binance после трансформации.
-        """
         return pa.schema([
             ('timestamp_ms', pa.int64()),
             ('connection_id', pa.string()),
             ('trade_id', pa.int64()),
             ('price', pa.float64()),
-            ('qty', pa.float64()),  # Signed: + купля, - продажа
+            ('qty', pa.float64()),
             ('trade_time_ms', pa.int64()),
         ])
     
@@ -463,11 +469,7 @@ class GateCollector:
         ])
     
     async def add_symbol(self, symbol: str):
-        """
-        Добавляет символ к подписке.
-        
-        Принимает нормализованный формат (btcusdt, ethusdt).
-        """
+        """Добавляет символ к подписке."""
         s = symbol.lower()
         
         async with self.symbol_lock:
@@ -476,16 +478,13 @@ class GateCollector:
             
             self.active_symbols.add(s)
             
-            # Инициализируем буферы
             for conn in self.connections:
-                await conn._init_symbol_buffers(s)
+                await conn._ensure_symbol_buffer(s)
             
-            # Подписываемся на каналы
             gate_symbol = self.connections[0]._to_gate_symbol(s)
             
             for conn in self.connections:
                 if conn._ws_connected():
-                    # Trades
                     await conn.ws.send(json.dumps({
                         'time': int(time.time()),
                         'channel': 'futures.trades',
@@ -493,7 +492,6 @@ class GateCollector:
                         'payload': [gate_symbol]
                     }))
                     
-                    # Book ticker
                     await conn.ws.send(json.dumps({
                         'time': int(time.time()),
                         'channel': 'futures.book_ticker',
@@ -501,8 +499,6 @@ class GateCollector:
                         'payload': [gate_symbol]
                     }))
                     
-                    # ИСПРАВЛЕНО: подписка на полные снимки ордербука
-                    # interval="0" означает максимальную частоту обновлений
                     await conn.ws.send(json.dumps({
                         'time': int(time.time()),
                         'channel': 'futures.order_book',
@@ -524,7 +520,6 @@ class GateCollector:
             
             for conn in self.connections:
                 if conn._ws_connected():
-                    # Отписываемся от всех каналов
                     await conn.ws.send(json.dumps({
                         'time': int(time.time()),
                         'channel': 'futures.trades',
@@ -539,7 +534,6 @@ class GateCollector:
                         'payload': [gate_symbol]
                     }))
                     
-                    # ИСПРАВЛЕНО: отписка от полных снимков ордербука
                     await conn.ws.send(json.dumps({
                         'time': int(time.time()),
                         'channel': 'futures.order_book',
@@ -547,7 +541,8 @@ class GateCollector:
                         'payload': [gate_symbol, "20", "0"]
                     }))
             
-            await self.flush_all()
+            await self._flush_all()
+            
             self.active_symbols.discard(s)
             
             self.logger.info(f"➖ Removed: {s} (Gate: {gate_symbol})")
@@ -556,17 +551,10 @@ class GateCollector:
         """Возвращает статус коллектора."""
         connections_status = []
         for conn in self.connections:
-            buffer_counts = {}
-            async with conn._buffer_lock:
-                for symbol, buffers in conn.buffers.items():
-                    buffer_counts[symbol] = {
-                        dt: len(buf) for dt, buf in buffers.items()
-                    }
-            
             connections_status.append({
                 'id': conn.conn_id,
                 'connected': conn._ws_connected(),
-                'buffers': buffer_counts
+                'buffers': conn.get_buffer_stats()
             })
         
         return {
@@ -579,7 +567,6 @@ class GateCollector:
 async def main():
     collector = GateCollector(num_connections=2, max_workers=8)
     
-    # Используем нормализованный формат символов
     await collector.add_symbol("btcusdt")
     await collector.add_symbol("ethusdt")
     

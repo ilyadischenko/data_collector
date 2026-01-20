@@ -237,39 +237,43 @@ async def list_symbols(request: Request):
 
 
 # ==================== Upload Management ====================
+# ==================== Upload Management ====================
 
 @app.post("/upload/force")
 async def force_upload(request: Request, exchange: Optional[str] = None):
     """
     Принудительная загрузка файлов текущего часа.
-    Сбрасывает буферы коллекторов и загружает файлы в облако.
+    Загружает файлы в облако БЕЗ удаления исходных conn_*.parquet файлов.
     
     Query params:
-        exchange: конкретная биржа (binance/bybit/gate) или все если не указано
+        exchange: конкретная биржа (binance/gate) или все если не указано
+    
+    Как это работает:
+    1. CloudManager читает все conn_*.parquet файлы текущего часа
+    2. Объединяет их в merged_*.parquet
+    3. Сжимает (если включено)
+    4. Загружает в облако
+    5. Удаляет только merged файлы, НЕ трогая исходные conn_* файлы
     """
+    # Ждем немного, чтобы writer успел дописать свежие данные
+    await asyncio.sleep(2)
+    
     total_uploaded = 0
     
     if exchange:
         exch = exchange.lower()
         if exch == 'binance':
-            await request.app.state.binance.flush_all()
             count = await request.app.state.manager_binance.force_upload_current()
             total_uploaded += count
         elif exch == 'gate':
-            await request.app.state.gate.flush_all()
             count = await request.app.state.manager_gate.force_upload_current()
             total_uploaded += count
         else:
-            raise HTTPException(400, "Unknown exchange")
+            raise HTTPException(400, "Unknown exchange. Use 'binance' or 'gate'")
     else:
-        # Сбрасываем буферы всех коллекторов
-        await request.app.state.binance.flush_all()
-        await request.app.state.gate.flush_all()
-        
         # Загружаем файлы всех бирж
         count_b = await request.app.state.manager_binance.force_upload_current()
         count_g = await request.app.state.manager_gate.force_upload_current()
-
         total_uploaded = count_b + count_g
 
     logger.info(f"⚡ Force upload: {total_uploaded} files")
@@ -277,36 +281,42 @@ async def force_upload(request: Request, exchange: Optional[str] = None):
     return {
         "status": "success",
         "uploaded_files": total_uploaded,
-        "exchange": exchange or "all"
+        "exchange": exchange or "all",
+        "note": "Original conn_* files preserved, only merged files removed"
     }
-
 
 @app.post("/upload/symbol")
 async def upload_symbol(request: Request, body: UploadRequest):
     """
-    Загрузить все файлы конкретного символа.
+    Загрузить все файлы конкретного символа за ВСЕ часы.
     
     Body:
         {
             "exchange": "binance",
             "symbol": "btcusdt",
-            "delete_after": false
+            "delete_after": false  # если true - удалит директории после загрузки
         }
+    
+    Как это работает:
+    1. Находит все директории symbol/{date}_{hour}/
+    2. Для каждого часа: объединяет conn_*.parquet → merged_*.parquet
+    3. Загружает в облако
+    4. Если delete_after=true: удаляет всю директорию часа (кроме текущего)
     """
     if not body.exchange or not body.symbol:
         raise HTTPException(400, "Both 'exchange' and 'symbol' are required")
     
+    # Ждем немного для свежести данных
+    await asyncio.sleep(2)
+    
     exch = body.exchange.lower()
     
-    # Сначала сбрасываем буферы
     if exch == 'binance':
-        await request.app.state.binance.flush_all()
         manager = request.app.state.manager_binance
     elif exch == 'gate':
-        await request.app.state.gate.flush_all()
         manager = request.app.state.manager_gate
     else:
-        raise HTTPException(400, "Unknown exchange")
+        raise HTTPException(400, "Unknown exchange. Use 'binance' or 'gate'")
 
     # Загружаем файлы символа
     count = await manager.force_upload_symbol(
@@ -324,9 +334,69 @@ async def upload_symbol(request: Request, body: UploadRequest):
         "exchange": exch,
         "symbol": body.symbol,
         "uploaded_files": count,
-        "deleted": body.delete_after
+        "deleted": body.delete_after,
+        "note": f"Current hour preserved, {count} files uploaded"
     }
 
+
+@app.post("/upload/cleanup")
+async def cleanup_old_hours(request: Request, exchange: Optional[str] = None):
+    """
+    Удалить старые директории часов (которые уже были загружены в облако).
+    
+    Query params:
+        exchange: конкретная биржа или все
+    
+    ВНИМАНИЕ: Это удалит все директории кроме текущего часа!
+    Убедитесь, что данные загружены в облако перед использованием.
+    """
+    deleted_dirs = []
+    
+    from pathlib import Path
+    from datetime import datetime, timezone
+    
+    data_dir = Path("collected_data")
+    current_hour_key = datetime.now(timezone.utc).strftime("%Y%m%d_%H")
+    
+    exchanges = [exchange.lower()] if exchange else ["binance", "gate"]
+    
+    for exch in exchanges:
+        exchange_dir = data_dir / exch
+        if not exchange_dir.exists():
+            continue
+        
+        for symbol_dir in exchange_dir.iterdir():
+            if not symbol_dir.is_dir():
+                continue
+            
+            for hour_dir in symbol_dir.iterdir():
+                if not hour_dir.is_dir():
+                    continue
+                
+                # Не трогаем текущий час
+                if hour_dir.name == current_hour_key:
+                    continue
+                
+                try:
+                    # Удаляем все файлы
+                    for file in hour_dir.glob("*"):
+                        file.unlink()
+                    
+                    # Удаляем директорию
+                    hour_dir.rmdir()
+                    deleted_dirs.append(f"{exch}/{symbol_dir.name}/{hour_dir.name}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to delete {hour_dir}: {e}")
+    
+    logger.info(f"🗑️ Cleanup: deleted {len(deleted_dirs)} directories")
+    
+    return {
+        "status": "success",
+        "deleted_directories": len(deleted_dirs),
+        "directories": deleted_dirs[:20],  # первые 20 для примера
+        "total": len(deleted_dirs)
+    }
 
 @app.post("/upload/all")
 async def upload_all(request: Request, exchange: Optional[str] = None, delete_after: bool = False):
