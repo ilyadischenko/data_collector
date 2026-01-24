@@ -28,9 +28,11 @@ class BinanceConnection:
         self.logger = logging.getLogger(f"Binance.{conn_id}")
         
         # Простые буферы: {symbol: {data_type: deque}}
-        # БЕЗ привязки к часам - просто накапливаем ВСЁ
         self.buffers: Dict[str, Dict[str, deque]] = {}
         self._buffer_lock = asyncio.Lock()
+        
+        # Для отслеживания активности
+        self._last_message_time = time.time()
     
     async def _ensure_symbol_buffer(self, symbol: str):
         """Создает буферы для символа если их нет."""
@@ -49,13 +51,19 @@ class BinanceConnection:
         
         while self.is_running:
             try:
+                # ВАЖНО: Включаем протокольный ping/pong
+                # Binance отправляет ping каждые 3 мин, ждет pong 10 мин
+                # Мы отправляем ping каждые 20 сек с таймаутом 60 сек
                 async with websockets.connect(
                     self.parent.ws_url,
-                    ping_interval=None,
+                    ping_interval=20,      # Отправка ping каждые 20 сек
+                    ping_timeout=60,       # Таймаут ожидания pong - 60 сек
+                    close_timeout=10,      # Таймаут на закрытие соединения
                     max_size=10_000_000,
                 ) as ws:
                     self.ws = ws
                     reconnect_delay = 1
+                    self._last_message_time = time.time()
                     self.logger.info(f"✅ Binance {self.conn_id} Connected")
                     
                     await self._subscribe_all()
@@ -63,6 +71,8 @@ class BinanceConnection:
                     async for msg in ws:
                         if not self.is_running:
                             break
+                        
+                        self._last_message_time = time.time()
                         await self._parse(msg)
                         
             except websockets.ConnectionClosed as e:
@@ -112,6 +122,7 @@ class BinanceConnection:
         try:
             data = json.loads(raw)
             
+            # Игнорируем ответы на подписку
             if "result" in data:
                 return
             
@@ -121,7 +132,6 @@ class BinanceConnection:
             
             event_type = data.get("e")
             
-            # Создаем буфер для символа если нужно
             await self._ensure_symbol_buffer(sym)
             
             async with self._buffer_lock:
@@ -131,7 +141,7 @@ class BinanceConnection:
             
             if event_type == "trade":
                 trade = {
-                    'timestamp_ms': data["E"],  # Exchange time
+                    'timestamp_ms': data["E"],
                     'connection_id': self.conn_id,
                     'trade_id': data["t"],
                     'price': float(data["p"]),
@@ -233,7 +243,7 @@ class BinanceCollector:
     async def run(self):
         """Запускает все соединения и фоновые задачи."""
         self.is_running = True
-        self.logger.info(f"🚀 Starting {self.num_connections} connections")
+        self.logger.info(f"🚀 Starting {self.num_connections} Binance connections")
         
         tasks = [
             *[conn.run() for conn in self.connections],
@@ -270,10 +280,8 @@ class BinanceCollector:
         flush_tasks = []
         
         for conn in self.connections:
-            # Получаем снимок и очищаем буферы
             snapshot = await conn.get_snapshot_and_clear()
             
-            # Распределяем данные по файлам согласно timestamp
             for symbol, data_types in snapshot.items():
                 for data_type, data_list in data_types.items():
                     if data_list:
@@ -305,7 +313,6 @@ class BinanceCollector:
             if not timestamp_ms:
                 continue
             
-            # Определяем hour_key из timestamp
             dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
             hour_key = dt.strftime("%Y%m%d_%H")
             
@@ -422,7 +429,6 @@ class BinanceCollector:
             
             self.active_symbols.add(s)
             
-            # Создаем буферы для символа в каждом соединении
             for conn in self.connections:
                 await conn._ensure_symbol_buffer(s)
             
@@ -460,7 +466,6 @@ class BinanceCollector:
                         'id': 1
                     }))
             
-            # Сбрасываем текущие буферы
             await self._flush_all()
             
             self.active_symbols.discard(s)

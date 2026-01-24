@@ -1,29 +1,24 @@
-
+import websockets 
 from typing import List
 
 
-class BaseCollector:
-    def start(self) -> None:
-        """
-        Запускает сбор данных
-        """
-        raise NotImplementedError("Метод start должен быть реализован в подклассе")
+class BaseConnector:
 
-    def add_symbol(self, symbol: str) -> None:
-        """
-        Добавляет символ в список отслеживаемых
-        """
-        raise NotImplementedError("Метод add_symbol должен быть реализован в подклассе")
-    
-    def remove_symbol(self, symbol: str) -> None:
-        """
-        Удаляет символ из списка отслеживаемых
-        """
-        raise NotImplementedError("Метод remove_symbol должен быть реализован в подклассе")
-    
-    def list_symbols(self) -> List[str]:
-        """
-        Возвращает список отслеживаемых символов
-        """
-        raise NotImplementedError("Метод list_symbols должен быть реализован в подклассе")
-    
+    def __init__(self, exchange: str, ws_url: str, conn_id: str, protocol_lvl_ping: bool) -> None:
+        self.exchange = exchange
+        self.ws_url = ws_url
+        self.conn_id = conn_id
+        self.protocol_lvl_ping = protocol_lvl_ping
+
+    async def run(self):
+        async with websockets.connect(self.ws_url) as websocket:
+            while True:
+                try:
+                    message = await websocket.recv()
+                    self.handle_message(message)
+                except websockets.ConnectionClosed:
+                    break
+
+    def handle_message(self, message: str) -> None:
+        pass
+

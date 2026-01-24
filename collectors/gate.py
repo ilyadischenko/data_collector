@@ -30,6 +30,10 @@ class GateConnection:
         # Простые буферы: {symbol: {data_type: deque}}
         self.buffers: Dict[str, Dict[str, deque]] = {}
         self._buffer_lock = asyncio.Lock()
+        
+        # Для пинга на уровне приложения
+        self._ping_task: Optional[asyncio.Task] = None
+        self._last_pong_time = time.time()
     
     def _normalize_symbol(self, gate_symbol: str) -> str:
         """Gate.io: BTC_USDT -> btcusdt"""
@@ -52,6 +56,36 @@ class GateConnection:
                     "depth": deque()
                 }
     
+    async def _app_ping_loop(self):
+        """Отправляет пинг на уровне приложения каждые 30 секунд."""
+        while self.is_running and self._ws_connected():
+            try:
+                await asyncio.sleep(30)
+                
+                if not self._ws_connected():
+                    break
+                
+                ping_msg = {
+                    "time": int(time.time()),
+                    "channel": "futures.ping"
+                }
+                
+                await self.ws.send(json.dumps(ping_msg))
+                self.logger.debug(f"📡 Sent app-level ping")
+                
+                # Проверка на таймаут pong (если не получили ответ за 60 сек)
+                if time.time() - self._last_pong_time > 60:
+                    self.logger.warning(f"⚠️ No pong received for 60s, reconnecting...")
+                    if self.ws:
+                        await self.ws.close()
+                    break
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Ping loop error: {e}")
+                break
+    
     async def run(self):
         """Основной цикл соединения с автореконнектом."""
         self.is_running = True
@@ -59,16 +93,22 @@ class GateConnection:
         
         while self.is_running:
             try:
+                # Включаем протокольный ping/pong (20 секунд интервал, 30 секунд таймаут)
                 async with websockets.connect(
                     self.parent.ws_url,
-                    ping_interval=None,
+                    ping_interval=20,
+                    ping_timeout=30,
                     max_size=10_000_000,
                 ) as ws:
                     self.ws = ws
                     reconnect_delay = 1
+                    self._last_pong_time = time.time()
                     self.logger.info(f"✅ Gate {self.conn_id} Connected")
                     
                     await self._subscribe_all()
+                    
+                    # Запускаем пинг на уровне приложения
+                    self._ping_task = asyncio.create_task(self._app_ping_loop())
                     
                     async for msg in ws:
                         if not self.is_running:
@@ -83,6 +123,14 @@ class GateConnection:
                 break
             except Exception as e:
                 self.logger.error(f"Gate {self.conn_id} WS error: {e}", exc_info=True)
+            finally:
+                # Останавливаем пинг-задачу
+                if self._ping_task and not self._ping_task.done():
+                    self._ping_task.cancel()
+                    try:
+                        await self._ping_task
+                    except asyncio.CancelledError:
+                        pass
             
             if self.is_running:
                 self.logger.info(f"🔄 Reconnect in {reconnect_delay}s")
@@ -133,10 +181,16 @@ class GateConnection:
         try:
             data = json.loads(raw)
             
+            # Обрабатываем pong
+            channel = data.get('channel', '')
+            if channel == 'futures.pong':
+                self._last_pong_time = time.time()
+                self.logger.debug(f"🏓 Received pong")
+                return
+            
             if 'event' in data and data['event'] == 'subscribe':
                 return
             
-            channel = data.get('channel', '')
             event = data.get('event', '')
             
             if channel == 'futures.order_book':
@@ -246,6 +300,14 @@ class GateConnection:
     async def stop(self):
         """Останавливает соединение."""
         self.is_running = False
+        
+        if self._ping_task and not self._ping_task.done():
+            self._ping_task.cancel()
+            try:
+                await self._ping_task
+            except asyncio.CancelledError:
+                pass
+        
         if self.ws:
             try:
                 await self.ws.close()
