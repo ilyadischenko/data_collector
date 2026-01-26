@@ -3,6 +3,7 @@ from collections import deque
 import websockets
 import json
 import time
+import gc
 import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +11,12 @@ from pathlib import Path
 from typing import Set, Dict, Optional, List
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -27,11 +34,14 @@ class BinanceConnection:
         self.is_running = False
         self.logger = logging.getLogger(f"Binance.{conn_id}")
         
-        # Простые буферы: {symbol: {data_type: deque}}
+        # Уменьшенные буферы для снижения памяти
         self.buffers: Dict[str, Dict[str, deque]] = {}
         self._buffer_lock = asyncio.Lock()
         
-        # Для отслеживания активности
+        # Пороги для мониторинга
+        self.MAX_BUFFER_SIZE = 50_000  # было 100_000
+        self.EMERGENCY_THRESHOLD = 250_000  # было 500_000
+        
         self._last_message_time = time.time()
     
     async def _ensure_symbol_buffer(self, symbol: str):
@@ -39,9 +49,10 @@ class BinanceConnection:
         async with self._buffer_lock:
             if symbol not in self.buffers:
                 self.buffers[symbol] = {
-                    "trades": deque(),
-                    "bookticker": deque(),
-                    "depth": deque()
+                    # УМЕНЬШЕНЫ для экономии памяти
+                    "trades": deque(maxlen=50_000),      # было 100_000
+                    "bookticker": deque(maxlen=25_000),  # было 50_000
+                    "depth": deque(maxlen=25_000)        # было 50_000
                 }
     
     async def run(self):
@@ -51,14 +62,11 @@ class BinanceConnection:
         
         while self.is_running:
             try:
-                # ВАЖНО: Включаем протокольный ping/pong
-                # Binance отправляет ping каждые 3 мин, ждет pong 10 мин
-                # Мы отправляем ping каждые 20 сек с таймаутом 60 сек
                 async with websockets.connect(
                     self.parent.ws_url,
-                    ping_interval=20,      # Отправка ping каждые 20 сек
-                    ping_timeout=60,       # Таймаут ожидания pong - 60 сек
-                    close_timeout=10,      # Таймаут на закрытие соединения
+                    ping_interval=20,
+                    ping_timeout=60,
+                    close_timeout=10,
                     max_size=10_000_000,
                 ) as ws:
                     self.ws = ws
@@ -122,7 +130,6 @@ class BinanceConnection:
         try:
             data = json.loads(raw)
             
-            # Игнорируем ответы на подписку
             if "result" in data:
                 return
             
@@ -178,20 +185,22 @@ class BinanceConnection:
         except Exception as e:
             self.logger.debug(f"Parse error: {e}")
     
-    async def get_snapshot_and_clear(self) -> Dict[str, Dict[str, List[dict]]]:
+    async def flush_symbol(self, symbol: str) -> Dict[str, List[dict]]:
         """
-        Создает снимок ВСЕХ буферов и очищает их.
-        Возвращает: {symbol: {data_type: [data]}}
+        STREAMING: Забирает и очищает буферы ТОЛЬКО одного символа.
+        Возвращает: {data_type: [data]}
         """
         result = {}
         
         async with self._buffer_lock:
-            for symbol, buffers in self.buffers.items():
-                result[symbol] = {}
-                for data_type, buffer in buffers.items():
-                    if buffer:
-                        result[symbol][data_type] = list(buffer)
-                        buffer.clear()
+            if symbol not in self.buffers:
+                return result
+            
+            buffers = self.buffers[symbol]
+            for data_type, buffer in buffers.items():
+                if buffer:
+                    result[data_type] = list(buffer)
+                    buffer.clear()  # ← СРАЗУ очищаем
         
         return result
     
@@ -207,10 +216,14 @@ class BinanceConnection:
     def get_buffer_stats(self) -> dict:
         """Возвращает статистику буферов."""
         stats = {}
+        total = 0
         for symbol, buffers in self.buffers.items():
-            stats[symbol] = {
-                dt: len(buf) for dt, buf in buffers.items()
-            }
+            symbol_stats = {dt: len(buf) for dt, buf in buffers.items()}
+            stats[symbol] = symbol_stats
+            total += sum(symbol_stats.values())
+        
+        stats['_total'] = total
+        stats['_warning'] = total > self.EMERGENCY_THRESHOLD
         return stats
 
 
@@ -236,9 +249,24 @@ class BinanceCollector:
         
         self._write_semaphore = asyncio.Semaphore(max_workers)
         
+        # Очистка старых .tmp файлов при старте
+        self._cleanup_temp_files()
+        
         for i in range(num_connections):
             conn = BinanceConnection(f"conn_{i+1}", self)
             self.connections.append(conn)
+    
+    def _cleanup_temp_files(self):
+        """Удаляет оставшиеся .tmp файлы при старте."""
+        count = 0
+        for tmp_file in self.data_dir.rglob("*.tmp"):
+            try:
+                tmp_file.unlink()
+                count += 1
+            except Exception as e:
+                self.logger.error(f"Failed to cleanup {tmp_file}: {e}")
+        if count > 0:
+            self.logger.info(f"🗑️ Cleaned up {count} .tmp files")
     
     async def run(self):
         """Запускает все соединения и фоновые задачи."""
@@ -247,7 +275,8 @@ class BinanceCollector:
         
         tasks = [
             *[conn.run() for conn in self.connections],
-            self._writer_task()
+            self._writer_task(),
+            self._memory_monitor()
         ]
         
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -265,47 +294,176 @@ class BinanceCollector:
         self.thread_pool.shutdown(wait=True)
         self.logger.info("✅ Stopped")
     
-    async def _writer_task(self):
-        """Задача записи: каждые 5 сек берет буферы и пишет в файлы."""
+    async def _memory_monitor(self):
+        """Мониторинг памяти каждые 30 секунд."""
+        if not PSUTIL_AVAILABLE:
+            self.logger.warning("⚠️ psutil not available, memory monitoring disabled")
+            return
+        
+        process = psutil.Process()
+        
         while self.is_running:
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
             
             try:
+                mem_info = process.memory_info()
+                mem_percent = process.memory_percent()
+                
+                # Подсчёт буферов
+                total_buffered = sum(
+                    sum(
+                        sum(len(buf) for buf in buffers.values())
+                        for buffers in conn.buffers.values()
+                    )
+                    for conn in self.connections
+                )
+                
+                self.logger.info(
+                    f"📊 Memory: {mem_info.rss / 1024 / 1024:.1f} MB ({mem_percent:.1f}%), "
+                    f"Buffers: {total_buffered:,} items"
+                )
+                
+                # КРИТИЧЕСКИЕ ПОРОГИ
+                if mem_percent > 80:
+                    self.logger.error(
+                        f"🚨 CRITICAL: Memory usage {mem_percent:.1f}%! "
+                        f"Forcing garbage collection and flush..."
+                    )
+                    
+                    gc.collect()
+                    await self._flush_all()
+                    
+                    await asyncio.sleep(5)
+                    new_mem = process.memory_percent()
+                    self.logger.info(
+                        f"📉 After cleanup: {new_mem:.1f}% "
+                        f"(freed {mem_percent - new_mem:.1f}%)"
+                    )
+                
+                elif mem_percent > 60:
+                    self.logger.warning(
+                        f"⚠️ High memory usage: {mem_percent:.1f}%"
+                    )
+                
+                if total_buffered > 500_000:  # адаптировано к новым лимитам
+                    self.logger.error(
+                        f"🚨 CRITICAL: {total_buffered:,} items buffered! "
+                        f"Forcing flush..."
+                    )
+                    await self._flush_all()
+                
+            except Exception as e:
+                self.logger.error(f"Memory monitor error: {e}")
+    
+    async def _writer_task(self):
+        """Задача записи с адаптивной частотой."""
+        min_interval = 2
+        max_interval = 10
+        current_interval = 5
+        
+        while self.is_running:
+            await asyncio.sleep(current_interval)
+            
+            try:
+                start_time = time.time()
+                
+                # Подсчёт буферов перед сбросом
+                total_before = sum(
+                    sum(
+                        sum(len(buf) for buf in buffers.values())
+                        for buffers in conn.buffers.values()
+                    )
+                    for conn in self.connections
+                )
+                
                 await self._flush_all()
+                
+                flush_duration = time.time() - start_time
+                
+                # Адаптивная частота
+                if total_before > 250_000:
+                    current_interval = max(min_interval, current_interval - 0.5)
+                    self.logger.warning(
+                        f"⚡ Increasing flush frequency to every {current_interval}s "
+                        f"(buffer size: {total_before:,})"
+                    )
+                elif total_before < 50_000 and current_interval < max_interval:
+                    current_interval = min(max_interval, current_interval + 0.5)
+                
+                if flush_duration > 10:
+                    self.logger.warning(
+                        f"⏱️ Slow flush: {flush_duration:.1f}s for {total_before:,} items"
+                    )
+                
             except Exception as e:
                 self.logger.error(f"Writer task error: {e}", exc_info=True)
     
     async def _flush_all(self):
-        """Берет snapshot всех буферов и распределяет по файлам."""
+        """
+        STREAMING FLUSH: Обрабатываем символы по одному.
+        Минимизирует пиковое потребление памяти.
+        """
+        # Собираем список активных символов
+        all_symbols = set()
+        for conn in self.connections:
+            async with conn._buffer_lock:
+                all_symbols.update(conn.buffers.keys())
+        
+        if not all_symbols:
+            return
+        
+        # Обрабатываем каждый символ последовательно
+        for symbol in all_symbols:
+            try:
+                await self._flush_symbol(symbol)
+            except Exception as e:
+                self.logger.error(f"Error flushing {symbol}: {e}", exc_info=True)
+    
+    async def _flush_symbol(self, symbol: str):
+        """
+        Сбрасывает данные ОДНОГО символа со ВСЕХ соединений.
+        Данные в памяти только для одного символа в каждый момент.
+        """
         flush_tasks = []
         
+        # Забираем данные со всех соединений для этого символа
         for conn in self.connections:
-            snapshot = await conn.get_snapshot_and_clear()
+            symbol_data = await conn.flush_symbol(symbol)
             
-            for symbol, data_types in snapshot.items():
-                for data_type, data_list in data_types.items():
-                    if data_list:
-                        # Группируем по часам
-                        hourly_data = self._group_by_hour(data_list)
-                        
-                        # Пишем каждый час в отдельный файл
-                        for hour_key, hour_data in hourly_data.items():
-                            task = self._write_with_semaphore(
-                                symbol, data_type, conn.conn_id, hour_data, hour_key
-                            )
-                            flush_tasks.append(task)
+            if not symbol_data:
+                continue
+            
+            # Обрабатываем каждый тип данных
+            for data_type, data_list in symbol_data.items():
+                if not data_list:
+                    continue
+                
+                # Группируем по часам
+                hourly_data = self._group_by_hour(data_list)
+                
+                # Создаём задачи записи
+                for hour_key, hour_data in hourly_data.items():
+                    task = self._write_with_semaphore(
+                        symbol, data_type, conn.conn_id, hour_data, hour_key
+                    )
+                    flush_tasks.append(task)
+                
+                # Явно освобождаем память
+                del data_list
+            
+            del symbol_data
         
+        # Выполняем запись параллельно (но только для одного символа)
         if flush_tasks:
             results = await asyncio.gather(*flush_tasks, return_exceptions=True)
             errors = [r for r in results if isinstance(r, Exception)]
             if errors:
-                self.logger.error(f"Flush errors: {len(errors)}/{len(flush_tasks)}")
+                self.logger.error(
+                    f"Flush errors for {symbol}: {len(errors)}/{len(flush_tasks)}"
+                )
     
     def _group_by_hour(self, data_list: List[dict]) -> Dict[str, List[dict]]:
-        """
-        Группирует данные по часам на основе timestamp_ms.
-        Возвращает: {hour_key: [data]}
-        """
+        """Группирует данные по часам на основе timestamp_ms."""
         hourly_data = {}
         
         for item in data_list:
@@ -329,53 +487,50 @@ class BinanceCollector:
         async with self._write_semaphore:
             return await asyncio.get_event_loop().run_in_executor(
                 self.thread_pool,
-                self._write_parquet,
+                self._write_parquet_rotation,
                 symbol, data_type, conn_id, data, hour_key
             )
     
-    def _write_parquet(self, symbol: str, data_type: str, conn_id: str, 
-                      data: List[dict], hour_key: str):
-        """Атомарная запись с .tmp файлом."""
+    def _write_parquet_rotation(self, symbol: str, data_type: str, conn_id: str, 
+                               data: List[dict], hour_key: str):
+        """
+        ROTATION: Каждый flush создаёт НОВЫЙ файл с timestamp.
+        CloudManager потом соберёт все conn_*.parquet файлы.
+        """
         if not data:
             return
         
         symbol_dir = self.data_dir / symbol / hour_key
         symbol_dir.mkdir(parents=True, exist_ok=True)
         
-        final_filepath = symbol_dir / f"{conn_id}_{data_type}.parquet"
-        temp_filepath = symbol_dir / f"{conn_id}_{data_type}.parquet.tmp"
+        # ROTATION: timestamp в имени файла
+        timestamp_ms = int(time.time() * 1000)
+        
+        # ВАЖНО: сохраняем паттерн conn_*_{data_type}.parquet
+        # чтобы CloudManager мог найти файлы через glob("conn_*_{data_type}.parquet")
+        filename = f"{conn_id}_{data_type}_{timestamp_ms}.parquet"
+        filepath = symbol_dir / filename
         
         schema = self._get_schema(data_type)
         if not schema:
             return
         
         try:
-            new_table = pa.Table.from_pylist(data, schema=schema)
+            # Просто создаём и пишем - БЕЗ чтения старых файлов!
+            table = pa.Table.from_pylist(data, schema=schema)
             
-            if final_filepath.exists():
-                existing = pq.read_table(final_filepath)
-                combined = pa.concat_tables([existing, new_table])
-                
-                pq.write_table(
-                    combined,
-                    temp_filepath,
-                    compression='zstd',
-                    compression_level=3
-                )
-            else:
-                pq.write_table(
-                    new_table,
-                    temp_filepath,
-                    compression='zstd',
-                    compression_level=3
-                )
+            pq.write_table(
+                table,
+                filepath,
+                compression='zstd',
+                compression_level=3  # быстрая запись
+            )
             
-            temp_filepath.replace(final_filepath)
+            # Явно освобождаем память
+            del table
             
         except Exception as e:
-            self.logger.error(f"Parquet write error for {final_filepath}: {e}")
-            if temp_filepath.exists():
-                temp_filepath.unlink()
+            self.logger.error(f"Parquet write error for {filepath}: {e}")
     
     def _get_schema(self, data_type: str) -> Optional[pa.Schema]:
         """Возвращает схему по типу данных."""
@@ -466,7 +621,8 @@ class BinanceCollector:
                         'id': 1
                     }))
             
-            await self._flush_all()
+            # Сбрасываем только этот символ
+            await self._flush_symbol(s)
             
             self.active_symbols.discard(s)
             

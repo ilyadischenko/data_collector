@@ -8,3 +8,4 @@ websockets
 pyarrow
 pydantic
 pandas
+psutil

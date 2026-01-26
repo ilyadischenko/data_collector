@@ -171,7 +171,7 @@ class CloudManager:
         if not hour_dir.exists():
             return None
         
-        source_files = list(hour_dir.glob(f"conn_*_{data_type}.parquet"))
+        source_files = list(hour_dir.glob(f"conn_*_{data_type}_*.parquet"))
         
         if not source_files:
             self.logger.debug(f"No files for {symbol}/{date}_{hour}/{data_type}")
