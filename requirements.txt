@@ -1,11 +1,25 @@
-fastapi
-uvicorn
-aiogram
-aiohttp
-orjson
-boto3
-websockets
-pyarrow
-pydantic
-pandas
-psutil
+# Core dependencies
+uvloop>=0.22.1
+orjson>=3.11.4
+pyarrow>=14.0.0
+pandas>=2.0.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Monitoring
+psutil>=5.9.0
+
+# Async
+asyncio
+aiofiles
+
+# Cloud storage (uncomment as needed)
+boto3>=1.28.0  # For AWS S3
+# google-cloud-storage>=2.10.0  # For Google Cloud Storage
+# aioboto3>=11.0.0  # Async S3
+
+# Development
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.0.0

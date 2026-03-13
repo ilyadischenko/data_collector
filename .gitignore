@@ -2,5 +2,5 @@ data_futures
 data
 collected_data
 integrity_checks
-__pycache__
+__pycache__/
 .DS_Store
