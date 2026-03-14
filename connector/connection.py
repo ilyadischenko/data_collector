@@ -91,8 +91,7 @@ class Connection:
 
     async def _watchdog(self):
         """Проверяет что сообщения приходят, иначе переподключает"""
-        while True:
-            
+        while True:            
             await asyncio.sleep(self._check_interval)
 
             if self.msg_count == 0 and self.symbols:
@@ -102,7 +101,6 @@ class Connection:
                 )
                 if self.ws._ws:
                     await self.ws._ws.close()
-                # ws.run() сам переподключится и вызовет on_connect
             else:
                 logger.debug(
                     f"[{self.market_type} {self.conn_id}] {self.msg_count} сообщений за {self._check_interval} с., "
@@ -114,15 +112,14 @@ class Connection:
         """Запускает WS и подписывается"""
         dm_task = asyncio.create_task(self.data_manager.run())
 
-        # запускаем WS в фоне
         ws_task = asyncio.create_task(self.ws.run())
 
         wd_task = asyncio.create_task(self._watchdog())
+        
         # ждём подключения
         while not self.ws.is_connected:
             await asyncio.sleep(0.1)
 
-        # ждём пока WS работает
         try:
             await ws_task
         finally:

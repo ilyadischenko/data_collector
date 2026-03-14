@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -9,12 +8,10 @@ from pathlib import Path
 import time
 
 import orjson
-import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
-
 
 
 class DataManager:
@@ -42,7 +39,6 @@ class DataManager:
         self._current_hour: str = ""
         self._running = False
 
-        # self.total_received: int = 0
         self.total_flushed: int = 0
 
     # ── извлечение полей ──────────────────────────────────
@@ -88,7 +84,6 @@ class DataManager:
             return False
 
         buf.append(raw)
-        # self.total_received += 1
 
         if len(buf) >= self._flush_count:
             self._flush_symbol(symbol)
@@ -163,12 +158,9 @@ class DataManager:
             logger.error(f"Ошибка записи [{symbol}]: {e}")
 
 
-
-
     def flush_all(self):
         flushed = 0
         for symbol in list(self._buffers.keys()):
-            # logger.info(f'Делаю флаш для {symbol}')
             flushed += self._flush_symbol(symbol)
         
         # in_memory = sum(len(b) for b in self._buffers.values())
@@ -190,14 +182,12 @@ class DataManager:
 
     async def run(self):
         self._running = True
-        # logger.info(f"DataManager [{self._market_type}:{self._conn_id}] запущен")
 
         while self._running:
             await asyncio.sleep(self._flush_interval)
             await asyncio.get_event_loop().run_in_executor(
                 self._executor, self.flush_all
             )
-            # self.flush_all()
 
 
     def stop(self):

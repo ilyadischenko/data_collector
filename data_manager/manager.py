@@ -9,14 +9,11 @@ import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from data_manager.cloud_manager import CloudManager
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-ASSEMBLE_CONFIGS = {
-    "trades": {"sort_by": "E", "dedup_col": "t"},        # по trade id
-    "depth":  {"sort_by": "E", "dedup_col": ["U", "u"]}, # по диапазону обновлений
-    "ob_snapshot": {"sort_by": "ts", "dedup_col": None},  # без дедупа
-}
 
 class DataManager:
     def __init__(self, data_dir: str = '../data', interval: float = 60.0):
@@ -26,6 +23,8 @@ class DataManager:
 
         self.compression = "zstd"
         self.compression_level = 9
+
+        self.cloud_manager = CloudManager()
 
 
     def _get_target_hour(self) -> tuple[str, str]:
@@ -55,7 +54,6 @@ class DataManager:
                     result.append(date_dir)
 
         logger.info(f"Найдено {len(result)} папок с чанками за {date}/{hour}")
-        print(f"Найдено {len(result)} папок с чанками за {date}/{hour}")
 
         return result
     
@@ -88,6 +86,23 @@ class DataManager:
 
         if tasks:
             await asyncio.gather(*tasks)
+
+        if self.cloud_manager:
+            # date_dir структура: data/{market}/{symbol}/{date}
+            market = date_dir.parent.parent.name
+            symbol = date_dir.parent.name
+            date   = date_dir.name
+
+            upload_tasks = []
+            for data_type in chunk_groups:
+                out_path = date_dir / f"{hour}-{data_type}.parquet"
+                if out_path.exists():
+                    upload_tasks.append(
+                        self.cloud_manager.async_upload(out_path, market, symbol, date, hour, data_type)
+                    )
+
+            if upload_tasks:
+                await asyncio.gather(*upload_tasks)
 
     async def assembling_loop(self):
         while True:
@@ -268,11 +283,11 @@ class DataManager:
             await self.assemble_hour(date, hour)
 
             # ждём до начала следующего часа
-            now = datetime.now(tz=timezone.utc)
-            next_hour = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
-            wait = (next_hour - now).total_seconds()
-            logger.info(f"Следующая сборка через {wait:.0f}с")
-            await asyncio.sleep(wait)
+            # now = datetime.now(tz=timezone.utc)
+            # next_hour = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
+            # wait = (next_hour - now).total_seconds()
+            # logger.info(f"Следующая сборка через {wait:.0f}с")
+            await asyncio.sleep(30)
         
 
 symb = 'zrousdt'

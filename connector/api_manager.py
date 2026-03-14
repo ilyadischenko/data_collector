@@ -80,37 +80,6 @@ class ApiManager:
                 logger.error('Rate limit на запрос символов')
                 await asyncio.sleep(5)
     
-    async def _poll_snapshots(self, market_type: str, interval: int = 3600):
-        """Опрашивает все символы по кругу с равномерной задержкой."""
-        while True:
-            symbols = self.futures_symbols if market_type == 'futures' else self.spot_symbols
-            max_limit = self.futures_minutes_limit if market_type == 'futures' else self.spot_minutes_limit
-
-            if not symbols:
-                await asyncio.sleep(5)
-                continue
-
-            interval = 3600
-
-            for symbol in list(symbols):  # list() — копия, если symbols обновится в процессе
-                used_weight = self.futures_used_weight if market_type == 'futures' else self.spot_used_weight
-
-                if used_weight > max_limit * 0.8:  # если использовано больше 80% лимита, ждем до следующей минуты
-                    wait = 60 - datetime.now().second + 1  # ждем до начала следующей минуты
-                    logger.warning(f"[{market_type}] Лимит {used_weight}/{max_limit}, пауза {wait}с")
-                    await asyncio.sleep(wait)
-
-                for attempt in range(3):
-                    success = await self.request_orderbook(symbol, market_type)
-                    if success:
-                        break
-                    logger.warning(f"[{market_type}] {symbol} попытка {attempt + 1}/3 неудачна")
-                    await asyncio.sleep(2 ** attempt)  # 1с, 2с, 4с
-                else:
-                    logger.error(f"[{market_type}] {symbol} не удалось получить стакан после 3 попыток")
-
-            await asyncio.sleep(interval)
-
     def _load_blacklist(self):
             if not self._blacklist_file.exists():
                 return
@@ -137,7 +106,6 @@ class ApiManager:
 
     async def remove_from_blacklist(self, symbol: str, market_type: str):
         self.blacklist[market_type].discard(symbol)
-        # символ появится сам при следующем _check_symbols
 
     async def _check_symbols(self, market_type: str, on_add, on_remove, interval: int = 300):
         while True:
@@ -169,8 +137,6 @@ class ApiManager:
         self.ready.set()
 
         await asyncio.gather(
-            # self._poll_snapshots('futures'),
-            # self._poll_snapshots('spot'),
             self._check_symbols('futures', self.on_add_symbol, self.on_remove_symbol),
             self._check_symbols('spot', self.on_add_symbol, self.on_remove_symbol),
         )
@@ -178,3 +144,4 @@ class ApiManager:
 
     async def stop(self):
         await self.session.close()
+        self.ready.clear()

@@ -4,8 +4,6 @@ from typing import Awaitable, Callable
 import websockets
 from websockets.asyncio.client import connect, ClientConnection
 
-
-
 logger = logging.getLogger(__name__)
 
 OnMessage = Callable[[str], Awaitable[None]]
@@ -39,7 +37,7 @@ class WSClient:
             self.url,
             ping_interval=20,
             ping_timeout=50,
-            close_timeout=5
+            close_timeout=10
         ) as ws:
             self._ws = ws
 
@@ -48,9 +46,7 @@ class WSClient:
 
             # вызываем колбэк после подключения
             if self._on_connect:
-                # logger.info("Вызываю он коннект")
                 await self._on_connect()
-            
             
             async for raw in ws:
                 if not self.is_running:

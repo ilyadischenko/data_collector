@@ -26,8 +26,8 @@ async def main():
     asyncio.create_task(monitor.run())
     manager = ConnectorsManager(data_dir = DATA_DIR)
     
-    # data_manager = DataManager(data_dir='./data')
-    # asyncio.create_task(data_manager.assembling_loop())
+    data_manager = DataManager(data_dir='./data')
+    asyncio.create_task(data_manager.run())
 
     try:
         await manager.run()

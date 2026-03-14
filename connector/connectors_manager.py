@@ -3,17 +3,14 @@ import json
 import logging
 from pathlib import Path
 
-
 from connector.connection import Connection
 from connector.api_manager import ApiManager
 from connector.request_ws_connection import RequestWsConnection
 from connector.monitor import Monitor
 
 
-
 logger = logging.getLogger(__name__)
 
-# BLACKLIST_FILE = Path("../blacklist.json")
 BLACKLIST_FILE = Path(__file__).parent.parent / 'blacklist.json'
 
 class ConnectorsManager:
@@ -86,7 +83,6 @@ class ConnectorsManager:
         self._save_blacklist()
 
         await self.api_manager.remove_from_blacklist(symbol, market_type)
-        # WS подписка появится сама через _check_symbols в ApiManager
 
 
     def _batch_symbols(self, symbols: list[str], batch_size: int = 100) -> list[list[str]]:
@@ -180,40 +176,3 @@ class ConnectorsManager:
         for connector in self.connections["spot"]:
             await connector.stop()
         logger.info("Все коннекты остановлены")
-
-
-
-
-
-
-
-
-
-
-# ── запуск ──
-
-async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    )
-    monitor = Monitor()
-    asyncio.create_task(monitor.run())
-    manager = ConnectorsManager()
-    
-
-    try:
-        await manager.run()
-    except KeyboardInterrupt:
-        logger.info("Остановка по Ctrl+C")
-        await manager.stop()
-
-
-if __name__ == "__main__":
-    try:
-        import uvloop
-        uvloop.install()
-    except ImportError:
-        pass
-
-    asyncio.run(main())

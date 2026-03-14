@@ -13,6 +13,7 @@ psutil>=5.9.0
 # Async
 asyncio
 aiofiles
+aiohttp
 
 # Cloud storage (uncomment as needed)
 boto3>=1.28.0  # For AWS S3
