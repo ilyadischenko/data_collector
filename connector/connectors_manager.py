@@ -6,7 +6,6 @@ from pathlib import Path
 from connector.connection import Connection
 from connector.api_manager import ApiManager
 from connector.request_ws_connection import RequestWsConnection
-from monitor import Monitor
 
 
 logger = logging.getLogger(__name__)
