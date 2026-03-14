@@ -2,15 +2,17 @@ import asyncio
 import json
 import logging
 import random
-from ws_client import WSClient
-from data_manager import DataManager
-from schemas import SCHEMAS
+
+from connector.ws_client import WSClient
+from connector.data_manager import DataManager
+from connector.schemas import SCHEMAS
+
 logger = logging.getLogger(__name__)
 
 
 
 class Connection:
-    def __init__(self, conn_id: int, symbols: list, market_type: str, max_symbols: int = 150, check_interval: int = 30):
+    def __init__(self, conn_id: int, symbols: list, market_type: str, data_dir, max_symbols: int = 150, check_interval: int = 30):
         self.conn_id = conn_id
         self.symbols = symbols
         self.market_type = market_type
@@ -22,7 +24,8 @@ class Connection:
             market_type='futures' if self.market_type == 'futures' else 'spot',
             conn_id=self.conn_id,
             schemas=SCHEMAS,
-            flush_interval=30.0
+            flush_interval=30.0,
+            data_dir=data_dir
         )
 
         for sym in self.symbols:
@@ -42,7 +45,7 @@ class Connection:
 
     async def _on_connect(self):
         """Вызывается после каждого (пере)подключения."""
-        logger.info(f"Коннектор [{self.market_type} {self.conn_id}] подключен, подписываемся на {len(self.symbols)} символов")
+        # logger.info(f"Коннектор [{self.market_type} {self.conn_id}] подключен, подписываемся на {len(self.symbols)} символов")
         await self._subscribe()
     
     async def add_symbol(self, symbol) -> bool:

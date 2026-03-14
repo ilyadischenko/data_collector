@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,7 @@ from pathlib import Path
 import time
 
 import orjson
+import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -169,7 +171,18 @@ class DataManager:
             # logger.info(f'Делаю флаш для {symbol}')
             flushed += self._flush_symbol(symbol)
         
-        logger.info(f'Коннектор [{self._market_type} {self._conn_id}] сбросил {flushed} сообщений на диск')
+        # in_memory = sum(len(b) for b in self._buffers.values())
+    
+        # # память процесса
+        # process = psutil.Process(os.getpid())
+        # ram_mb = process.memory_info().rss / 1024 ** 2
+        
+        # logger.info(
+        #     f'Коннектор [{self._market_type} {self._conn_id}] '
+        #     f'сбросил {flushed} | в буферах осталось {in_memory} | '
+        #     f'RAM процесса {ram_mb:.1f} MB'
+        # )
+        # logger.info(f'Коннектор [{self._market_type} {self._conn_id}] сбросил {flushed} сообщений на диск')
 
 
 
@@ -177,16 +190,15 @@ class DataManager:
 
     async def run(self):
         self._running = True
-        logger.info(f"DataManager [{self._market_type}:{self._conn_id}] запущен")
+        # logger.info(f"DataManager [{self._market_type}:{self._conn_id}] запущен")
 
         while self._running:
             await asyncio.sleep(self._flush_interval)
-            self.flush_all()
-            # in_memory = sum(len(b) for b in self._buffers.values())
-            # logger.info(
-            #     f"[{self._market_type}:{self._conn_id}] "
-            #     f"received={self.total_received:,} "
-            # )
+            await asyncio.get_event_loop().run_in_executor(
+                self._executor, self.flush_all
+            )
+            # self.flush_all()
+
 
     def stop(self):
         self._running = False

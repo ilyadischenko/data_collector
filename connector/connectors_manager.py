@@ -4,20 +4,26 @@ import logging
 from pathlib import Path
 
 
-from connection import Connection
-from api_manager import ApiManager
-from request_ws_connection import RequestWsConnection
-from monitor import Monitor
+from connector.connection import Connection
+from connector.api_manager import ApiManager
+from connector.request_ws_connection import RequestWsConnection
+from connector.monitor import Monitor
 
 
 
 logger = logging.getLogger(__name__)
 
-BLACKLIST_FILE = Path("../blacklist.json")
+# BLACKLIST_FILE = Path("../blacklist.json")
+BLACKLIST_FILE = Path(__file__).parent.parent / 'blacklist.json'
 
 class ConnectorsManager:
-    def __init__(self):
+    def __init__(self, data_dir, batch_size: int = 100, replicas_count: int = 2):
+
         self.tasks = []
+        self.batch_size = batch_size
+        self.replicas_count = replicas_count
+        self.data_dir = data_dir
+
 
         self.connections = {
             "futures": [],
@@ -29,7 +35,7 @@ class ConnectorsManager:
 
         """Загружает blacklist из файла при старте."""
         if not BLACKLIST_FILE.exists():
-            self._save_blacklist()
+            self.blacklist = self._save_blacklist()
             return
 
         try:
@@ -51,6 +57,7 @@ class ConnectorsManager:
         """Сохраняет blacklist в файл."""
         with open(BLACKLIST_FILE, "w") as f:
             json.dump(self.blacklist, f, indent=2)
+            return f
         logger.debug(f"Blacklist сохранён: {BLACKLIST_FILE}")
 
     async def add_to_blacklist(self, symbol: str, market_type: str):
@@ -87,7 +94,7 @@ class ConnectorsManager:
 
     def create_connection(self, type: str, symbols: list[str]):
         conn_id = len(self.connections[type]) + 1
-        conn = Connection(conn_id=conn_id, symbols=symbols, market_type=type)
+        conn = Connection(conn_id=conn_id, symbols=symbols, market_type=type, data_dir=self.data_dir)
         self.connections[type].append(conn)
         return conn
 
@@ -136,15 +143,15 @@ class ConnectorsManager:
         
         await self.api_manager.ready.wait()
 
-        self.futures_request_ws = RequestWsConnection(conn_id=1, symbols=self.api_manager.futures_symbols, market_type='futures')
+        self.futures_request_ws = RequestWsConnection(conn_id=1, symbols=self.api_manager.futures_symbols, market_type='futures', data_dir=self.data_dir)
         self.tasks.append(asyncio.create_task(self.futures_request_ws.run()))
-        self.spot_request_ws = RequestWsConnection(conn_id=1, symbols=self.api_manager.spot_symbols, market_type='spot')
+        self.spot_request_ws = RequestWsConnection(conn_id=2, symbols=self.api_manager.spot_symbols, market_type='spot', data_dir=self.data_dir)
         self.tasks.append(asyncio.create_task(self.spot_request_ws.run()))
 
-        futures_batches = self._batch_symbols(self.api_manager.futures_symbols)
-        spot_batches = self._batch_symbols(self.api_manager.spot_symbols)
+        futures_batches = self._batch_symbols(self.api_manager.futures_symbols, batch_size=self.batch_size)
+        spot_batches = self._batch_symbols(self.api_manager.spot_symbols, batch_size=self.batch_size)
 
-        for _ in range(2):
+        for _ in range(self.replicas_count):
             for i in futures_batches:
                 self.create_connection(type='futures', symbols=i)
             

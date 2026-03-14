@@ -6,10 +6,11 @@ import random
 import time
 
 import orjson
-from request_ws_data_manager import SnapshotWriter
-from ws_client import WSClient
-from data_manager import DataManager
-from schemas import SCHEMAS
+
+from connector.request_ws_data_manager import SnapshotWriter
+from connector.ws_client import WSClient
+
+from connector.schemas import SCHEMAS
 import uuid
 
 
@@ -18,13 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 class RequestWsConnection:
-    def __init__(self, conn_id: int, symbols: list, market_type: str, ob_limit: int = 100, interval: int = 300):
+    def __init__(self, conn_id: int, symbols: list, market_type: str, data_dir, ob_limit: int = 100, interval: int = 300):
         self.conn_id = conn_id
         self.symbols = symbols
         self.market_type = market_type
         self.ob_limit = ob_limit
         self.interval = interval
-        self.snapshot_writer = SnapshotWriter(market_type=self.market_type, flush_interval=30.0)
+        self.snapshot_writer = SnapshotWriter(market_type=self.market_type, flush_interval=30.0, data_dir=data_dir)
 
         self.callbacks = {}
         

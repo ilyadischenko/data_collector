@@ -6,7 +6,7 @@ from pathlib import Path
 import aiohttp
 import orjson
 
-from api_data_manager import SnapshotWriter
+
 
 
 logger = logging.getLogger(__name__)
@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 class ApiManager:
     def __init__(self,  on_add_symbol, on_remove_symbol, orderbook_limit: int = 100):
         self.session: aiohttp.ClientSession
-        self.writer: SnapshotWriter = SnapshotWriter(flush_interval=10.0)
 
         self.futures_symbols = []
         self.spot_symbols = []
@@ -42,38 +41,6 @@ class ApiManager:
         }
         self._blacklist_file = Path("../blacklist.json")
 
-        
-
-
-    async def request_orderbook(self, symbol: str, market_type: str):
-        params = {"symbol": symbol.upper(), "limit": self.orderbook_limit}
-
-        url = f"{self.futures_url if market_type == 'futures' else self.spot_url}/depth"
-        params = {"symbol": symbol.upper(), "limit": self.orderbook_limit}
-        
-        logger.info(f"Запрос стакана: {url} {params}")
-        async with self.session.get(url=url, params=params) as resp:
-            used = int(resp.headers.get("x-mbx-used-weight-1m", 0))
-            
-            if market_type == 'futures':
-                self.futures_used_weight = used
-            else:
-                self.spot_used_weight = used
-
-            if resp.status == 200:
-                data = orjson.loads(await resp.read())
-                self.writer.add(symbol=symbol.lower(), market_type=market_type, data=data)
-
-                return True
-            
-            elif resp.status == 429: 
-                logger.error('Rate limit на запрос символов')
-                return False
-        
-            logger.error(f"Ошибка {resp.status} при запросе стакана для {symbol} [{market_type}]")
-    
-        return False
-    
     async def request_symbols(self, market_type: str):
         async with self.session.get(url=f'{self.futures_url if market_type == 'futures' else self.spot_url}/exchangeInfo') as resp:
             if resp.status == 200:
@@ -202,7 +169,6 @@ class ApiManager:
         self.ready.set()
 
         await asyncio.gather(
-            self.writer.run(),
             # self._poll_snapshots('futures'),
             # self._poll_snapshots('spot'),
             self._check_symbols('futures', self.on_add_symbol, self.on_remove_symbol),

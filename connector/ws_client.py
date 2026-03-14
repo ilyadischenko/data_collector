@@ -38,7 +38,7 @@ class WSClient:
         async with connect(
             self.url,
             ping_interval=20,
-            ping_timeout=10,
+            ping_timeout=50,
             close_timeout=5
         ) as ws:
             self._ws = ws
@@ -48,7 +48,7 @@ class WSClient:
 
             # вызываем колбэк после подключения
             if self._on_connect:
-                logger.info("Вызываю он коннект")
+                # logger.info("Вызываю он коннект")
                 await self._on_connect()
             
             

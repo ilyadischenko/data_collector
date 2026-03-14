@@ -18,8 +18,3 @@ aiofiles
 boto3>=1.28.0  # For AWS S3
 # google-cloud-storage>=2.10.0  # For Google Cloud Storage
 # aioboto3>=11.0.0  # Async S3
-
-# Development
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-black>=23.0.0

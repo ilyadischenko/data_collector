@@ -58,7 +58,6 @@ class DataManager:
         print(f"Найдено {len(result)} папок с чанками за {date}/{hour}")
 
         return result
-
     
     async def assembling_file(self, date_dir: Path, hour: str):
         chunk_groups: dict[str, list[Path]] = {}
@@ -89,7 +88,6 @@ class DataManager:
 
         if tasks:
             await asyncio.gather(*tasks)
-
 
     async def assembling_loop(self):
         while True:
@@ -263,6 +261,20 @@ class DataManager:
             chunk.unlink()
         # logger.info(f"[ob_snapshot] Собран {out_path.name}: {len(combined)} строк из {len(chunks)} чанков")
 
+    async def run(self):
+        while True:
+            date, hour = self._get_target_hour()
+
+            await self.assemble_hour(date, hour)
+
+            # ждём до начала следующего часа
+            now = datetime.now(tz=timezone.utc)
+            next_hour = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
+            wait = (next_hour - now).total_seconds()
+            logger.info(f"Следующая сборка через {wait:.0f}с")
+            await asyncio.sleep(wait)
+        
+
 symb = 'zrousdt'
 market_type = 'spot'
 hour = '10'
@@ -277,7 +289,7 @@ async def main():
     await dm.assemble_hour('2026-03-13', hour)
     print(f"Сборка за {hour} завершена за {(datetime.datetime.now() - start).total_seconds():.2f} секунд")
 
-asyncio.run(main())
+# asyncio.run(main())
 
 # import pandas as pd
 
