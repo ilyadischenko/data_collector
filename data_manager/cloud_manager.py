@@ -40,8 +40,8 @@ class CloudManager:
                     Body=f.read(),
                     ContentType="application/octet-stream",
                 )
-            size_kb = local_path.stat().st_size / 1024
-            logger.info(f"[s3] ✅ {key} ({size_kb:.1f} KB)")
+            # size_kb = local_path.stat().st_size / 1024
+            # logger.info(f"[s3] ✅ {key} ({size_kb:.1f} KB)")
             return True
         except Exception as e:
             logger.error(f"[s3] ❌ {key}: {e}")

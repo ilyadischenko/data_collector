@@ -1,7 +1,8 @@
 
 
 # tg
-telegram_token = ''
+telegram_token = '7706834120:AAFRZ77Oh8mTNgKHXfacwYLr2AOckoNk1Mo'
+telegram_chat_id = '840481448'
 
 
 # s3

@@ -22,7 +22,9 @@ class DataManager:
         self._executor = ThreadPoolExecutor(max_workers=4)
 
         self.compression = "zstd"
-        self.compression_level = 9
+        self.compression_level = 12
+
+        self._failed_uploads: list[dict] = []
 
         self.cloud_manager = CloudManager()
 
@@ -87,22 +89,83 @@ class DataManager:
         if tasks:
             await asyncio.gather(*tasks)
 
-        if self.cloud_manager:
-            # date_dir структура: data/{market}/{symbol}/{date}
-            market = date_dir.parent.parent.name
-            symbol = date_dir.parent.name
-            date   = date_dir.name
+        if not self.cloud_manager:
+            return
 
-            upload_tasks = []
-            for data_type in chunk_groups:
-                out_path = date_dir / f"{hour}-{data_type}.parquet"
-                if out_path.exists():
-                    upload_tasks.append(
-                        self.cloud_manager.async_upload(out_path, market, symbol, date, hour, data_type)
-                    )
+        market = date_dir.parent.parent.name
+        symbol = date_dir.parent.name
+        date   = date_dir.name
 
-            if upload_tasks:
-                await asyncio.gather(*upload_tasks)
+        upload_tasks = []
+        data_types   = []
+        for data_type in chunk_groups:
+            out_path = date_dir / f"{hour}-{data_type}.parquet"
+            if out_path.exists():
+                upload_tasks.append(
+                    self.cloud_manager.async_upload(out_path, market, symbol, date, hour, data_type)
+                )
+                data_types.append(data_type)
+
+        if not upload_tasks:
+            return
+
+        results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+        for data_type, result in zip(data_types, results):
+            out_path = date_dir / f"{hour}-{data_type}.parquet"
+            if result is True:
+                out_path.unlink(missing_ok=True)
+                logger.info(f"[s3] Загружен и удалён {out_path.name}")
+            else:
+                logger.error(f"[s3] Ошибка загрузки {out_path.name}: {result}")
+                self._failed_uploads.append({
+                    "path":      out_path,
+                    "market":    market,
+                    "symbol":    symbol,
+                    "date":      date,
+                    "hour":      hour,
+                    "data_type": data_type,
+                })
+
+        # if self.cloud_manager:
+        #     # date_dir структура: data/{market}/{symbol}/{date}
+        #     market = date_dir.parent.parent.name
+        #     symbol = date_dir.parent.name
+        #     date   = date_dir.name
+
+        #     upload_tasks = []
+        #     for data_type in chunk_groups:
+        #         out_path = date_dir / f"{hour}-{data_type}.parquet"
+        #         if out_path.exists():
+        #             upload_tasks.append(
+        #                 self.cloud_manager.async_upload(out_path, market, symbol, date, hour, data_type)
+        #             )
+
+        #     if upload_tasks:
+        #         await asyncio.gather(*upload_tasks)
+
+    async def _retry_failed_uploads(self):
+        if not self._failed_uploads:
+            return
+
+        pending = self._failed_uploads[:]
+        self._failed_uploads.clear()
+        logger.info(f"[s3] Retry {len(pending)} файлов")
+
+        for item in pending:
+            if not item["path"].exists():
+                logger.warning(f"[s3] Файл пропал: {item['path'].name}")
+                continue
+            result = await self.cloud_manager.async_upload(
+                item["path"], item["market"], item["symbol"],
+                item["date"], item["hour"], item["data_type"]
+            )
+            if result is True:
+                item["path"].unlink(missing_ok=True)
+                logger.info(f"[s3] Retry успешен: {item['path'].name}")
+            else:
+                logger.error(f"[s3] Retry провален: {item['path'].name}")
+                self._failed_uploads.append(item)
+
 
     async def assembling_loop(self):
         while True:
@@ -124,32 +187,31 @@ class DataManager:
         )
         tasks = [self.assembling_file(d, hour) for d in date_dirs]
         if tasks:
+            await asyncio.sleep(30)
             await asyncio.gather(*tasks)
             logger.info(f"Сборка завершена: {len(tasks)} папок за {date}/{hour}")
-        else:
-            logger.info(f"Нет папок для сборки за {date}/{hour}")
+
+        # retry сразу после сборки
+        if self._failed_uploads:
+            logger.info(f"[s3] Retry {len(self._failed_uploads)} файлов...")
+            await self._retry_failed_uploads()
+        # else:
+        #     logger.info(f"Нет папок для сборки за {date}/{hour}")
 
     def assemble_trades(self, date_dir: Path, hour: str):
         chunks = list(date_dir.glob(f"{hour}-trades-*-*.parquet"))
 
         if not chunks:
-            # logger.info(f"[trades] Нет чанков в {date_dir} за час {hour}")
             return
 
-        # logger.info(f"[trades] Найдено {len(chunks)} чанков:")
         tables = []
         for c in chunks:
             t = pq.read_table(c)
-            # logger.info(f"  {c.name}: {len(t)} строк")
             tables.append(t)
 
         combined = pa.concat_tables(tables).to_pandas()
-        # logger.info(f"[trades] Всего после объединения: {len(combined)} строк")
 
-        before = len(combined)
         combined = combined.drop_duplicates(subset="t")
-        removed = before - len(combined)
-        # logger.info(f"[trades] После дедупа по t: {len(combined)} строк, удалено: {removed}")
 
         combined['q'] = combined.apply(
             lambda row: '-' + row['q'] if row['m'] else row['q'], axis=1
@@ -157,36 +219,27 @@ class DataManager:
         combined = combined.drop(columns=['m'])
 
         combined = combined.sort_values("t").reset_index(drop=True)
-        # logger.info(f"[trades] Отсортировано по t, монотонно: {combined['t'].is_monotonic_increasing}")
 
         out_path = date_dir / f"{hour}-trades.parquet"
         pq.write_table(pa.Table.from_pandas(combined, preserve_index=False), out_path, compression=self.compression, compression_level=self.compression_level)
-        # logger.info(f"[trades] Сохранён {out_path}")
 
         for chunk in chunks:
             chunk.unlink()
-        # logger.info(f"[trades] Удалено {len(chunks)} чанков")
 
     def assemble_depth(self, date_dir: Path, hour: str):
         chunks = list(date_dir.glob(f"{hour}-depth-*-*.parquet"))
         if not chunks:
-            # logger.info(f"[depth] Нет чанков в {date_dir} за час {hour}")
             return
 
-        # logger.info(f"[depth] Найдено {len(chunks)} чанков:")
+
         tables = []
         for c in chunks:
             t = pq.read_table(c)
-            # logger.info(f"  {c.name}: {len(t)} строк")
             tables.append(t)
 
         combined = pa.concat_tables(tables).to_pandas()
-        # logger.info(f"[depth] Всего после объединения: {len(combined)} строк")
 
-        before = len(combined)
         combined = combined.drop_duplicates(subset=["E", "U", "u"])
-        removed = before - len(combined)
-        # logger.info(f"[depth] После дедупа: {len(combined)} строк, удалено: {removed}")
 
         combined = combined.sort_values("E").reset_index(drop=True)
 
@@ -223,23 +276,19 @@ class DataManager:
 
         for chunk in chunks:
             chunk.unlink()
-        # logger.info(f"[depth] Собран {out_path.name}: {len(combined)} строк из {len(chunks)} чанков")
+
 
     def assemble_ob_snapshot(self, date_dir: Path, hour: str):
         chunks = list(date_dir.glob(f"{hour}-ob_snapshot-*.parquet"))
         if not chunks:
-            # logger.info(f"[ob_snapshot] Нет чанков в {date_dir} за час {hour}")
             return
 
-        # logger.info(f"[ob_snapshot] Найдено {len(chunks)} чанков:")
         tables = []
         for c in chunks:
             t = pq.read_table(c)
-            # logger.info(f"  {c.name}: {len(t)} строк")
             tables.append(t)
 
         combined = pa.concat_tables(tables).to_pandas()
-        # logger.info(f"[ob_snapshot] Всего после объединения: {len(combined)} строк")
 
         combined = combined.sort_values("ts").reset_index(drop=True)
 
@@ -274,7 +323,6 @@ class DataManager:
 
         for chunk in chunks:
             chunk.unlink()
-        # logger.info(f"[ob_snapshot] Собран {out_path.name}: {len(combined)} строк из {len(chunks)} чанков")
 
     async def run(self):
         while True:
@@ -287,7 +335,7 @@ class DataManager:
             # next_hour = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
             # wait = (next_hour - now).total_seconds()
             # logger.info(f"Следующая сборка через {wait:.0f}с")
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
         
 
 symb = 'zrousdt'

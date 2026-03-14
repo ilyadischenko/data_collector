@@ -10,6 +10,7 @@ import aiohttp
 import psutil
 from aiohttp import web
 
+from config import telegram_token, telegram_chat_id
 logger = logging.getLogger(__name__)
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
@@ -25,8 +26,8 @@ ALERT_CPU_PCT   = 95.0     # % CPU
 ALERT_DROP_MIN  = 1        # минимум drops для алерта
 
 # Telegram (заполни свои)
-TG_TOKEN  = ""
-TG_CHAT_ID = ""
+TG_TOKEN  = telegram_token
+TG_CHAT_ID = telegram_chat_id
 
 # Диск для мониторинга
 DISK_PATH = "/"
@@ -124,14 +125,15 @@ def collect_metrics(state: MonitorState) -> Metrics:
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
-async def send_telegram(session: aiohttp.ClientSession, text: str):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        await session.post(url, json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"})
-    except Exception as e:
-        logger.error(f"[monitor] Telegram ошибка: {e}")
+async def send_telegram(text: str):
+    async with aiohttp.ClientSession() as session:
+        if not TG_TOKEN or not TG_CHAT_ID:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+            await session.post(url, json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"})
+        except Exception as e:
+            logger.error(f"[monitor] Telegram ошибка: {e}")
 
 
 async def check_alerts(m: Metrics, state: MonitorState, session: aiohttp.ClientSession):
@@ -174,7 +176,7 @@ async def check_alerts(m: Metrics, state: MonitorState, session: aiohttp.ClientS
 
     for msg in alerts:
         logger.warning(f"[monitor] ALERT: {msg}")
-        # await send_telegram(session, msg)
+        await send_telegram(msg)
 
 
 # ─── Веб-дашборд ──────────────────────────────────────────────────────────────

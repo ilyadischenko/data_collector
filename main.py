@@ -1,10 +1,11 @@
 import asyncio
 import logging
 from pathlib import Path
+import aiohttp
 import uvloop
 
 from connector.connectors_manager import ConnectorsManager
-from connector.monitor import Monitor
+from monitor import Monitor, send_telegram
 
 from data_manager.manager import DataManager
 
@@ -29,8 +30,12 @@ async def main():
     data_manager = DataManager(data_dir='./data')
     asyncio.create_task(data_manager.run())
 
+    # async with aiohttp.ClientSession() as session:
+    #     await send_telegram(session, "asd")
+    
     try:
         await manager.run()
+        # await data_manager.run()
     except KeyboardInterrupt:
         logger.info("Остановка по Ctrl+C")
         await manager.stop()
