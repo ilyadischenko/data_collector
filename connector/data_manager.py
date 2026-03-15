@@ -1,3 +1,4 @@
+import gc
 import asyncio
 import logging
 import threading
@@ -151,17 +152,30 @@ class DataManager:
 
                     pq.write_table(table, filepath)
 
-                    # print(f'Сбросил {msg_type} для {symbol}. Lenght% [{len(by_hour.items())}]', flush=True)
-
+                    del table
+                
+            del by_type, by_hour
 
         except Exception as e:
             logger.error(f"Ошибка записи [{symbol}]: {e}")
+        
+        finally:
+            del rows_raw
 
 
     def flush_all(self):
         flushed = 0
         for symbol in list(self._buffers.keys()):
             flushed += self._flush_symbol(symbol)
+
+        gc.collect()
+        
+        # вернуть память OS
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
         
         # in_memory = sum(len(b) for b in self._buffers.values())
     

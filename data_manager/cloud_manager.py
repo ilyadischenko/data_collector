@@ -65,17 +65,36 @@ class CloudManager:
 
     def list_files(self, prefix: str = "") -> list[dict]:
         try:
-            response = self._s3.list_objects_v2(Bucket=self._bucket, Prefix=prefix)
-            if 'Contents' not in response:
-                return []
-            return [
-                {
-                    "key":           obj["Key"],
-                    "size_kb":       round(obj["Size"] / 1024, 1),
-                    "last_modified": obj["LastModified"],
-                }
-                for obj in response["Contents"]
-            ]
+            result = []
+            kwargs = {"Bucket": self._bucket, "Prefix": prefix}
+            
+            while True:
+                response = self._s3.list_objects_v2(**kwargs)
+                
+                if 'Contents' in response:
+                    result.extend([
+                        {
+                            "key":           obj["Key"],
+                            "size_kb":       round(obj["Size"] / 1024, 1),
+                            "last_modified": obj["LastModified"],
+                        }
+                        for obj in response["Contents"]
+                    ])
+                
+                if response.get("IsTruncated"):
+                    kwargs["ContinuationToken"] = response["NextContinuationToken"]
+                else:
+                    break
+            
+            return result
         except Exception as e:
             logger.error(f"[s3] list_files failed: {e}")
             return []
+            
+
+
+
+
+
+
+   

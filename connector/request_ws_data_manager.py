@@ -80,8 +80,10 @@ class SnapshotWriter:
                 filepath = out_dir / f"{hour_str}-ob_snapshot-{ts}.parquet"
                 pq.write_table(table, filepath)
 
+                del table
             except Exception as e:
                 logger.error(f"Ошибка записи снапшота [{symbol}]: {e}")
+
 
         logger.info(f"Снапшоты записаны: {len(snapshot)} символов")
 

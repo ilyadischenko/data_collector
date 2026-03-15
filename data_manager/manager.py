@@ -166,7 +166,6 @@ class DataManager:
                 logger.error(f"[s3] Retry провален: {item['path'].name}")
                 self._failed_uploads.append(item)
 
-
     async def assembling_loop(self):
         while True:
             date, hour = self._get_target_hour()
@@ -195,8 +194,7 @@ class DataManager:
         if self._failed_uploads:
             logger.info(f"[s3] Retry {len(self._failed_uploads)} файлов...")
             await self._retry_failed_uploads()
-        # else:
-        #     logger.info(f"Нет папок для сборки за {date}/{hour}")
+        
 
     def assemble_trades(self, date_dir: Path, hour: str):
         chunks = list(date_dir.glob(f"{hour}-trades-*-*.parquet"))
@@ -225,6 +223,10 @@ class DataManager:
 
         for chunk in chunks:
             chunk.unlink()
+
+        del combined, tables, tables
+        import gc
+        gc.collect()
 
     def assemble_depth(self, date_dir: Path, hour: str):
         chunks = list(date_dir.glob(f"{hour}-depth-*-*.parquet"))
@@ -276,6 +278,10 @@ class DataManager:
 
         for chunk in chunks:
             chunk.unlink()
+        
+        del combined, tables, table
+        import gc
+        gc.collect()
 
 
     def assemble_ob_snapshot(self, date_dir: Path, hour: str):
@@ -323,6 +329,10 @@ class DataManager:
 
         for chunk in chunks:
             chunk.unlink()
+
+        del combined, tables, table
+        import gc
+        gc.collect()
 
     async def run(self):
         while True:
